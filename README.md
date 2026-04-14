@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/Status-PoC-orange)
 
-**WhisperPair** is a Proof-of-Concept for **CVE-2025-36911**, a vulnerability in the **Google Fast Pair Service (GFPS)**. It includes a CLI exploit tool and a real-time web dashboard for scanning, testing, and exploiting vulnerable Bluetooth devices.
+**WhisperPair** is a Proof-of-Concept for **CVE-2025-36911**, a vulnerability in the **Google Fast Pair Service (GFPS)**. It includes a CLI exploit tool, a real-time web dashboard, and an Android companion app for scanning, testing, and exploiting vulnerable Bluetooth devices.
 
 **Key Insight:** Vulnerable devices accept RAW unencrypted Key-Based Pairing requests even when NOT in pairing mode - no Anti-Spoofing Public Key required.
 
@@ -26,35 +26,42 @@ The Fast Pair protocol contains an **Improper Access Control** vulnerability tha
 Once exploited, an attacker within BLE range (~30m) can:
 - **Force-pair** with the target device without user consent
 - **Hijack audio** via HFP/A2DP profiles (microphone access)
+- **Eavesdrop** on the device's microphone in real time
 - **Track the device** via Find My Device / Find Hub networks
 - **Persistent access** through injected Account Keys
+- **Cross-transport bonding** via CTKD-derived BR/EDR link keys
 
 ## Architecture
 
-The project has three main components:
-
 ```
 WhisperPair-PoC/
-├── fast_pair_demo.py      # Core exploit engine (CLI)
-├── app.py                 # Flask + Socket.IO backend (web interface)
-├── adb_manager.py         # ADB wrapper for Android phone pairing
-├── known_devices.py       # Device fingerprint database with quirk flags
-├── test_fast_pair_demo.py # Unit tests for exploit engine
-├── test_adb_manager.py    # Unit tests for ADB manager
-├── requirements.txt       # Python dependencies
-└── frontend/              # React (Vite) web dashboard
-    └── src/
-        ├── App.jsx
-        ├── socket.js
-        └── components/
-            ├── TopBar.jsx
-            ├── DevicePanel.jsx
-            ├── DeviceCard.jsx
-            ├── ExploitPanel.jsx
-            ├── StrategySelector.jsx
-            ├── LiveLog.jsx
-            ├── ResultCard.jsx
-            └── TrackingPrereqs.jsx
+├── fast_pair_demo.py       # Core exploit engine (CLI)
+├── app.py                  # Flask + Socket.IO backend (web interface)
+├── adb_manager.py          # ADB wrapper for Android phone pairing
+├── ctkd.py                 # Cross-Transport Key Derivation (BLE LTK → BR/EDR Link Key)
+├── fmdn_scanner.py         # Find My Device Network beacon scanner
+├── known_devices.py        # Device fingerprint database with quirk flags
+├── test_fast_pair_demo.py  # Unit tests for exploit engine
+├── test_adb_manager.py     # Unit tests for ADB manager
+├── requirements.txt        # Python dependencies
+├── frontend/               # React (Vite) web dashboard
+│   └── src/
+│       ├── App.jsx
+│       ├── socket.js
+│       └── components/
+│           ├── TopBar.jsx
+│           ├── DevicePanel.jsx
+│           ├── DeviceCard.jsx
+│           ├── ExploitPanel.jsx
+│           ├── StrategySelector.jsx
+│           ├── LiveLog.jsx
+│           ├── ResultCard.jsx
+│           ├── TrackingPrereqs.jsx
+│           └── EavesdropCard.jsx
+└── android/                # Android companion app
+    └── app/src/main/java/com/whisperpair/companion/
+        ├── FastPairActivity.java
+        └── EavesdropActivity.java
 ```
 
 ### Core Exploit Engine (`fast_pair_demo.py`)
@@ -79,10 +86,33 @@ A Flask + Socket.IO backend serving a React frontend that provides:
 - **Vulnerability test mode** - non-invasive test that sends KBP requests but skips Account Key writing and Classic BT pairing
 - **ADB integration** - detects connected Android phones and triggers Bluetooth pairing to register exploited devices with Find My Device
 - **Strategy selection** - choose which exploit strategies to attempt
+- **Device tracking** - two modes for Find My Device registration:
+  - **Phone mode** - launches the Android companion app via ADB to bond and register the device
+  - **Laptop mode** - derives a BR/EDR Link Key from the BLE LTK via CTKD and injects it into BlueZ
+- **Audio eavesdropping** - records the target device's microphone via HFP/A2DP after bonding, with real-time PCM audio streaming to the browser
 
-Socket.IO events: `scan:start`, `scan:device_found`, `scan:complete`, `exploit:start`, `exploit:stage`, `exploit:notification`, `exploit:result`, `exploit:stop`, `vuln_test:start`, `adb:scan`, `adb:select`, `adb:pair`
+Socket.IO events: `scan:start`, `scan:device_found`, `scan:complete`, `exploit:start`, `exploit:stage`, `exploit:notification`, `exploit:result`, `exploit:stop`, `vuln_test:start`, `adb:scan`, `adb:select`, `adb:pair`, `track:start`, `track:status`, `eavesdrop:start`, `eavesdrop:stop`, `eavesdrop:status`, `eavesdrop:audio`
 
 REST endpoints: `GET /api/status`, `GET /api/devices`, `GET /api/strategies`, `GET /api/known-devices`
+
+### Cross-Transport Key Derivation (`ctkd.py`)
+
+Implements CTKD per Bluetooth Core Spec Vol 3, Part H, Section 2.4.2.5 to derive a BR/EDR Link Key from a BLE Long Term Key (LTK). This enables Classic Bluetooth bonding from an existing BLE bond without the device being in pairing mode.
+
+1. Extract LTK from BlueZ config (`/var/lib/bluetooth/<adapter>/<device>/info`)
+2. Derive Link Key: `h6(h7("ble salt", LTK), "Link Key")` using AES-CMAC
+3. Inject Link Key into BlueZ config for the BR/EDR address
+4. Restart `bluetoothd` to load the new key
+5. Connect via Classic BT using the derived key
+
+### FMDN Beacon Scanner (`fmdn_scanner.py`)
+
+Scans for Find My Device Network (FMDN) beacons matching the Account Key injected during exploitation. After the Account Key is written, the target device begins broadcasting FMDN advertisements with Ephemeral Identifiers (EIDs) derived from the key.
+
+Detects beacons via:
+- FMDN service UUID (`0xFCAE`) with frame type `0x40`
+- Fast Pair service UUID (`0xFE2C`) with Account Key filter
+- Any advertisement from the known device address
 
 ### ADB Manager (`adb_manager.py`)
 
@@ -93,9 +123,21 @@ Wraps Android Debug Bridge commands to:
 - Pair the phone with an exploited target (tries `bluetooth_manager pair`, falls back to pairing intent)
 - Verify the target appears in the phone's bonded device list
 
+### Android Companion App (`android/`)
+
+A minimal Android app (API 31+, target 35) that runs the exploit directly on the phone:
+
+- **FastPairActivity** - Receives a BLE address via intent, runs KBP exploit, bonds via Classic Bluetooth
+- **EavesdropActivity** - Uses the HFP profile to access the target device's microphone
+
+Triggered from the backend via:
+```bash
+adb shell am start -a com.whisperpair.PAIR --es address AA:BB:CC:DD:EE:FF
+```
+
 ### Known Devices Database (`known_devices.py`)
 
-Contains fingerprints for devices from Google, JBL, Sony, Samsung, Bose, Nothing, OnePlus, and Jabra. Each entry includes:
+Contains fingerprints for 25+ devices from Google, JBL, Sony, Samsung, Bose, Nothing, OnePlus, and Jabra. Each entry includes:
 
 - Model ID, name, manufacturer, device type
 - **Quirk flags** that adjust exploit behavior:
@@ -156,6 +198,14 @@ cd frontend
 npm install
 ```
 
+### Android Companion App (optional)
+
+```bash
+cd android
+./gradlew assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
+```
+
 ## Usage
 
 ### CLI
@@ -183,6 +233,14 @@ npm run dev
 
 Then open the frontend URL in your browser. The dashboard connects to the backend via Socket.IO.
 
+### FMDN Beacon Scanner
+
+After a successful exploit with Account Key injection, scan for the device's FMDN beacons:
+
+```bash
+python3 fmdn_scanner.py
+```
+
 ### Example CLI Output
 
 ```
@@ -208,17 +266,20 @@ python3 -m pytest test_fast_pair_demo.py test_adb_manager.py -v
 
 ## Prerequisites
 
-- **Linux** with BlueZ stack (for `bluetoothctl` pairing)
+- **Linux** with BlueZ stack (for `bluetoothctl` pairing and CTKD key injection)
 - **Python 3.10+**
 - **Bluetooth adapter** with BLE support
+- **CAP_NET_RAW** capability (for CTKD raw HCI socket operations)
 - **ADB** (optional, for Android phone pairing / Find My Device tracking)
 - **Node.js** (optional, for the web dashboard frontend)
+- **Android SDK** (optional, for building the companion app)
 
 ## References
 
 - [CVE-2025-36911](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-36911)
 - [WhisperPair Research](https://whisperpair.eu)
 - [Google Fast Pair Specification](https://developers.google.com/nearby/fast-pair/spec)
+- [Bluetooth Core Spec - CTKD](https://www.bluetooth.com/specifications/specs/core-specification-6-0/) (Vol 3, Part H, Section 2.4.2.5)
 
 ## License
 

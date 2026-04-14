@@ -1,0 +1,138 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.whisperpair.companion"
+4    android:versionCode="1"
+5    android:versionName="1.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="31"
+9        android:targetSdkVersion="35" />
+10
+11    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+11-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:4:5-76
+11-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:4:22-73
+12    <uses-permission
+12-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:5:5-6:58
+13        android:name="android.permission.BLUETOOTH_SCAN"
+13-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:5:22-70
+14        android:usesPermissionFlags="neverForLocation" />
+14-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:6:9-55
+15    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+15-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:7:5-71
+15-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:7:22-68
+16    <uses-permission android:name="android.permission.INTERNET" />
+16-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:8:5-67
+16-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:8:22-64
+17    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+17-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:9:5-80
+17-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:9:22-77
+18    <uses-permission
+18-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:10:5-11:38
+19        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+19-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:10:22-78
+20        android:maxSdkVersion="28" />
+20-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:11:9-35
+21
+22    <uses-feature
+22-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:13:5-90
+23        android:name="android.hardware.bluetooth_le"
+23-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:13:19-63
+24        android:required="true" />
+24-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:13:64-87
+25
+26    <permission
+26-->[androidx.core:core:1.9.0] /home/pira/.gradle/caches/transforms-4/b06a0754b3702ea81ce4d3a9c88f93e5/transformed/core-1.9.0/AndroidManifest.xml:22:5-24:47
+27        android:name="com.whisperpair.companion.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+27-->[androidx.core:core:1.9.0] /home/pira/.gradle/caches/transforms-4/b06a0754b3702ea81ce4d3a9c88f93e5/transformed/core-1.9.0/AndroidManifest.xml:23:9-81
+28        android:protectionLevel="signature" />
+28-->[androidx.core:core:1.9.0] /home/pira/.gradle/caches/transforms-4/b06a0754b3702ea81ce4d3a9c88f93e5/transformed/core-1.9.0/AndroidManifest.xml:24:9-44
+29
+30    <uses-permission android:name="com.whisperpair.companion.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+30-->[androidx.core:core:1.9.0] /home/pira/.gradle/caches/transforms-4/b06a0754b3702ea81ce4d3a9c88f93e5/transformed/core-1.9.0/AndroidManifest.xml:26:5-97
+30-->[androidx.core:core:1.9.0] /home/pira/.gradle/caches/transforms-4/b06a0754b3702ea81ce4d3a9c88f93e5/transformed/core-1.9.0/AndroidManifest.xml:26:22-94
+31
+32    <application
+32-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:15:5-43:19
+33        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+33-->[androidx.core:core:1.9.0] /home/pira/.gradle/caches/transforms-4/b06a0754b3702ea81ce4d3a9c88f93e5/transformed/core-1.9.0/AndroidManifest.xml:28:18-86
+34        android:debuggable="true"
+35        android:extractNativeLibs="false"
+36        android:label="WhisperPair"
+36-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:16:9-36
+37        android:supportsRtl="true"
+37-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:17:9-35
+38        android:theme="@style/Theme.AppCompat.Light.NoActionBar" >
+38-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:18:9-65
+39        <activity
+39-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:20:9-32:20
+40            android:name="com.whisperpair.companion.FastPairActivity"
+40-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:21:13-45
+41            android:exported="true"
+41-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:22:13-36
+42            android:launchMode="singleTask" >
+42-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:23:13-44
+43            <intent-filter>
+43-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:24:13-27:29
+44                <action android:name="android.intent.action.MAIN" />
+44-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:25:17-69
+44-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:25:25-66
+45
+46                <category android:name="android.intent.category.LAUNCHER" />
+46-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:26:17-77
+46-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:26:27-74
+47            </intent-filter>
+48            <intent-filter>
+48-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:28:13-31:29
+49                <action android:name="com.whisperpair.PAIR" />
+49-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:29:17-63
+49-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:29:25-60
+50
+51                <category android:name="android.intent.category.DEFAULT" />
+51-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:30:17-76
+51-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:30:27-73
+52            </intent-filter>
+53        </activity>
+54        <activity
+54-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:34:9-42:20
+55            android:name="com.whisperpair.companion.EavesdropActivity"
+55-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:35:13-46
+56            android:exported="true"
+56-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:36:13-36
+57            android:launchMode="singleTask" >
+57-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:37:13-44
+58            <intent-filter>
+58-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:38:13-41:29
+59                <action android:name="com.whisperpair.EAVESDROP" />
+59-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:39:17-68
+59-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:39:25-65
+60
+61                <category android:name="android.intent.category.DEFAULT" />
+61-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:30:17-76
+61-->/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/android/app/src/main/AndroidManifest.xml:30:27-73
+62            </intent-filter>
+63        </activity>
+64
+65        <provider
+65-->[androidx.emoji2:emoji2:1.2.0] /home/pira/.gradle/caches/transforms-4/a969867f3b247d3a0da0458099d92bb3/transformed/emoji2-1.2.0/AndroidManifest.xml:24:9-32:20
+66            android:name="androidx.startup.InitializationProvider"
+66-->[androidx.emoji2:emoji2:1.2.0] /home/pira/.gradle/caches/transforms-4/a969867f3b247d3a0da0458099d92bb3/transformed/emoji2-1.2.0/AndroidManifest.xml:25:13-67
+67            android:authorities="com.whisperpair.companion.androidx-startup"
+67-->[androidx.emoji2:emoji2:1.2.0] /home/pira/.gradle/caches/transforms-4/a969867f3b247d3a0da0458099d92bb3/transformed/emoji2-1.2.0/AndroidManifest.xml:26:13-68
+68            android:exported="false" >
+68-->[androidx.emoji2:emoji2:1.2.0] /home/pira/.gradle/caches/transforms-4/a969867f3b247d3a0da0458099d92bb3/transformed/emoji2-1.2.0/AndroidManifest.xml:27:13-37
+69            <meta-data
+69-->[androidx.emoji2:emoji2:1.2.0] /home/pira/.gradle/caches/transforms-4/a969867f3b247d3a0da0458099d92bb3/transformed/emoji2-1.2.0/AndroidManifest.xml:29:13-31:52
+70                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+70-->[androidx.emoji2:emoji2:1.2.0] /home/pira/.gradle/caches/transforms-4/a969867f3b247d3a0da0458099d92bb3/transformed/emoji2-1.2.0/AndroidManifest.xml:30:17-75
+71                android:value="androidx.startup" />
+71-->[androidx.emoji2:emoji2:1.2.0] /home/pira/.gradle/caches/transforms-4/a969867f3b247d3a0da0458099d92bb3/transformed/emoji2-1.2.0/AndroidManifest.xml:31:17-49
+72            <meta-data
+72-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/pira/.gradle/caches/transforms-4/1dc65955cdda29fa59c3d0676864eece/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:31:13-33:52
+73                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
+73-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/pira/.gradle/caches/transforms-4/1dc65955cdda29fa59c3d0676864eece/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:32:17-78
+74                android:value="androidx.startup" />
+74-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/pira/.gradle/caches/transforms-4/1dc65955cdda29fa59c3d0676864eece/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:33:17-49
+75        </provider>
+76    </application>
+77
+78</manifest>

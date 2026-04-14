@@ -90,7 +90,7 @@ function InfoModal({ strategy, onClose }) {
   );
 }
 
-export default function StrategySelector({ selected, onChange, disabled }) {
+export default function StrategySelector({ selected, onChange, disabled, compact }) {
   const [infoStrategy, setInfoStrategy] = useState(null);
 
   const toggle = (name) => {
@@ -103,10 +103,10 @@ export default function StrategySelector({ selected, onChange, disabled }) {
   };
 
   return (
-    <div className="strategy-selector">
+    <div className={`strategy-selector ${compact ? 'strategy-compact' : ''}`}>
       <div className="strategy-header">
-        <Shield size={16} />
-        <h3>Exploit Strategies</h3>
+        <Shield size={14} />
+        <h3>Strategies</h3>
       </div>
       <div className="strategy-list">
         {STRATEGIES.map((strat) => (
@@ -123,16 +123,18 @@ export default function StrategySelector({ selected, onChange, disabled }) {
                   <span className="strategy-name">{strat.label}</span>
                   <code className="strategy-flags">{strat.flags}</code>
                 </div>
-                <span className="strategy-desc">{strat.description}</span>
+                {!compact && <span className="strategy-desc">{strat.description}</span>}
               </div>
             </label>
-            <button
-              className="info-btn"
-              onClick={() => setInfoStrategy(strat)}
-              title={`Info: ${strat.label}`}
-            >
-              <Info size={15} />
-            </button>
+            {!compact && (
+              <button
+                className="info-btn"
+                onClick={() => setInfoStrategy(strat)}
+                title={`Info: ${strat.label}`}
+              >
+                <Info size={15} />
+              </button>
+            )}
           </div>
         ))}
       </div>

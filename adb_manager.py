@@ -1,9 +1,15 @@
 """
 ADB Manager - Android Debug Bridge wrapper for WhisperPair
 Detects connected Android phones and triggers Bluetooth pairing via ADB.
+
+For Find My Device registration, the phone must pair through Google Play
+Services' Fast Pair flow (not regular Bluetooth pairing). This module
+enables Bluetooth and verifies new bonds after the user accepts the
+Fast Pair notification on their phone.
 """
 
 import subprocess
+import re
 
 
 class ADBManager:
@@ -85,45 +91,37 @@ class ADBManager:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
-    def pair_device(self, device_id, br_edr_address):
-        """Pair Android phone with target device. Tries multiple approaches for Android 14."""
-        # Approach 1: bluetooth_manager pair command
+    def get_bonded_addresses(self, device_id):
+        """Parse bonded device addresses from dumpsys bluetooth_manager."""
         try:
             result = subprocess.run(
-                ["adb", "-s", device_id, "shell", "cmd", "bluetooth_manager", "pair", br_edr_address],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0 and "error" not in result.stdout.lower():
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        # Approach 2: Bluetooth pairing intent
-        try:
-            result = subprocess.run(
-                [
-                    "adb", "-s", device_id, "shell", "am", "start",
-                    "-a", "android.bluetooth.device.action.PAIRING_REQUEST",
-                    "-e", "android.bluetooth.device.extra.DEVICE", br_edr_address,
-                ],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0:
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        return False
-
-    def verify_paired(self, device_id, br_edr_address):
-        """Check if the target device appears in the phone's bonded devices."""
-        try:
-            result = subprocess.run(
-                ["adb", "-s", device_id, "shell", "cmd", "bluetooth_manager", "list-bonded-devices"],
+                ["adb", "-s", device_id, "shell", "dumpsys", "bluetooth_manager"],
                 capture_output=True, text=True, timeout=10,
             )
-            if result.returncode == 0:
-                return br_edr_address.upper() in result.stdout.upper()
+            if result.returncode != 0:
+                return set()
+
+            addresses = set()
+            in_bonded = False
+            for line in result.stdout.splitlines():
+                if "Bonded devices:" in line:
+                    in_bonded = True
+                    continue
+                if in_bonded:
+                    stripped = line.strip()
+                    if not stripped:
+                        break
+                    match = re.match(r"([0-9A-Fa-f:]{17})", stripped)
+                    if match:
+                        addresses.add(match.group(1).upper())
+                    else:
+                        break
+            return addresses
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        return False
+            return set()
+
+    def verify_new_bond(self, device_id, bonded_before):
+        """Check if any new device was bonded compared to a baseline snapshot."""
+        bonded_after = self.get_bonded_addresses(device_id)
+        new_devices = bonded_after - bonded_before
+        return len(new_devices) > 0

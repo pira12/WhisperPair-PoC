@@ -737,6 +737,12 @@ body {
   color: var(--bg-root);
 }
 
+.mode-separator {
+  width: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
 .btn-test {
   width: 100%;
   justify-content: center;
@@ -872,6 +878,24 @@ body {
   font-size: 11.5px;
   color: var(--text-muted);
   line-height: 1.4;
+}
+
+/* Compact mode */
+.strategy-compact .strategy-item {
+  padding: 6px 10px 6px 12px;
+}
+
+.strategy-compact .strategy-name {
+  font-size: 11px;
+}
+
+.strategy-compact .strategy-flags {
+  font-size: 9px;
+  padding: 0px 4px;
+}
+
+.strategy-compact .strategy-item input[type='checkbox'] {
+  margin-top: 2px;
 }
 
 .info-btn {
@@ -1010,27 +1034,30 @@ body {
 }
 
 /* ==============================================================================
-   Strategy + Prereqs Row
+   Cards Row (Strategies + Tracking + Eavesdrop)
    ============================================================================== */
 
-.strategy-prereqs-row {
+.cards-row {
   display: flex;
-  gap: 12px;
+  gap: 10px;
   align-items: stretch;
 }
 
-.strategy-prereqs-row .strategy-selector {
+.cards-row .strategy-selector {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.cards-row .tracking-prereqs-card,
+.cards-row .eavesdrop-card {
   flex: 1;
   min-width: 0;
 }
 
 .tracking-prereqs-card {
-  width: 180px;
-  flex-shrink: 0;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
@@ -1100,6 +1127,71 @@ body {
 .prereq-fail svg {
   flex-shrink: 0;
   opacity: 0.35;
+}
+
+.tracking-actions-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px 12px;
+}
+
+.bredr-input {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 6px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.bredr-input:focus {
+  border-color: var(--info);
+}
+
+.bredr-input::placeholder {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.bredr-hint {
+  font-size: 9px;
+  color: var(--text-muted);
+  margin: 0;
+  line-height: 1.3;
+}
+
+.tracking-prereqs-card .btn-track {
+  width: auto;
+  font-size: 11px;
+  padding: 8px 12px;
+}
+
+.tracking-prereqs-card .tracking-progress,
+.tracking-prereqs-card .tracking-confirmed,
+.tracking-prereqs-card .tracking-warning,
+.tracking-prereqs-card .tracking-error {
+  margin: 4px 12px 12px;
+  font-size: 11px;
+}
+
+.tracking-prereqs-card .tracking-confirmed .btn-findmy {
+  font-size: 11px;
+  padding: 6px 10px;
+  width: 100%;
+  justify-content: center;
+}
+
+.tracking-prereqs-card .tracking-learn-more {
+  font-size: 10px;
+}
+
+.tracking-prereqs-card .tracking-learn-content {
+  font-size: 10px;
 }
 
 /* ==============================================================================
@@ -1263,7 +1355,6 @@ body {
   padding: 16px;
   border: 1px solid;
   position: relative;
-  overflow: hidden;
 }
 
 .result-vulnerable {
@@ -1279,6 +1370,7 @@ body {
   left: 0;
   right: 0;
   height: 2px;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
   background: repeating-linear-gradient(
     90deg,
     var(--vulnerable) 0px,
@@ -1753,4 +1845,190 @@ body {
 .btn-track-retry:hover {
   background: var(--bg-card-hover);
   border-color: var(--border-light);
+}
+
+/* ==============================================================================
+   Eavesdrop Card
+   ============================================================================== */
+
+.eavesdrop-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+}
+
+.eavesdrop-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(16, 19, 27, 0.4);
+}
+
+.eavesdrop-header svg {
+  color: var(--vulnerable);
+  opacity: 0.6;
+}
+
+.eavesdrop-header h3 {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  flex: 1;
+  margin: 0;
+}
+
+.eavesdrop-desc {
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin: 0;
+  padding: 8px 12px;
+}
+
+.btn-eavesdrop {
+  margin: 4px 12px 12px;
+  justify-content: center;
+  background: linear-gradient(135deg, #dc2626 0%, #9333ea 100%);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fff;
+  font-weight: 600;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  transition: all 0.15s ease;
+}
+
+.btn-eavesdrop:hover {
+  background: linear-gradient(135deg, #ef4444 0%, #a855f7 100%);
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.2);
+}
+
+.eavesdrop-recording {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 12px 12px;
+}
+
+.eavesdrop-recording-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--vulnerable);
+  font-weight: 500;
+}
+
+.btn-eavesdrop-stop {
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.eavesdrop-vu {
+  background: var(--bg-root);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  overflow: hidden;
+}
+
+.eavesdrop-vu code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--vulnerable);
+  white-space: pre;
+}
+
+.eavesdrop-done {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 12px 12px;
+}
+
+.eavesdrop-done-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--success);
+  font-weight: 500;
+}
+
+.btn-eavesdrop-download {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: linear-gradient(135deg, #16a34a 0%, #059669 100%);
+  border: 1px solid rgba(22, 163, 74, 0.4);
+  border-radius: var(--radius);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-eavesdrop-download:hover {
+  background: linear-gradient(135deg, #22c55e 0%, #10b981 100%);
+  box-shadow: 0 0 20px rgba(22, 163, 74, 0.2);
+}
+
+.btn-eavesdrop-again {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-eavesdrop-again:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-light);
+}
+
+.eavesdrop-warning,
+.eavesdrop-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+  padding: 4px 12px 12px;
+}
+
+.eavesdrop-warning svg,
+.eavesdrop-error svg {
+  color: var(--warning);
+  flex-shrink: 0;
 }

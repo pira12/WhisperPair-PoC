@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import socket from './socket';
 import TopBar from './components/TopBar';
 import DevicePanel from './components/DevicePanel';
@@ -15,9 +15,60 @@ function App() {
   const [result, setResult] = useState(null);
   const [adbDevices, setAdbDevices] = useState([]);
   const [selectedAdbDevice, setSelectedAdbDevice] = useState(null);
-  const [trackingStatus, setTrackingStatus] = useState(null); // null | 'pairing' | 'success' | 'warning' | 'error'
+  const [trackingStatus, setTrackingStatus] = useState(null);
   const [trackingMessage, setTrackingMessage] = useState('');
   const [vulnTestMode, setVulnTestMode] = useState(false);
+  const [attackMode, setAttackMode] = useState('phone'); // 'phone' | 'laptop'
+  const [eavesdropStatus, setEavesdropStatus] = useState(null);
+  const [eavesdropMessage, setEavesdropMessage] = useState('');
+  const [eavesdropDownload, setEavesdropDownload] = useState(null);
+  const [bredrAddress, setBredrAddress] = useState('');
+  const audioCtxRef = useRef(null);
+  const nextPlayTimeRef = useRef(0);
+
+  // Web Audio API: play raw PCM chunks from earbuds mic
+  useEffect(() => {
+    socket.on('eavesdrop:audio', (data) => {
+      // Decode base64 PCM
+      const raw = atob(data.pcm);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+
+      // Create AudioContext on first chunk
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: data.rate || 8000,
+        });
+        nextPlayTimeRef.current = audioCtxRef.current.currentTime;
+      }
+      const ctx = audioCtxRef.current;
+
+      // Convert 16-bit PCM to float32
+      const view = new DataView(bytes.buffer);
+      const numSamples = Math.floor(bytes.length / 2);
+      const audioBuffer = ctx.createBuffer(1, numSamples, data.rate || 8000);
+      const channel = audioBuffer.getChannelData(0);
+      for (let i = 0; i < numSamples; i++) {
+        channel[i] = view.getInt16(i * 2, true) / 32768;
+      }
+
+      // Schedule playback
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      if (nextPlayTimeRef.current < now) {
+        nextPlayTimeRef.current = now;
+      }
+      source.start(nextPlayTimeRef.current);
+      nextPlayTimeRef.current += audioBuffer.duration;
+    });
+
+    return () => {
+      socket.off('eavesdrop:audio');
+    };
+  }, []);
 
   useEffect(() => {
     socket.on('connect', () => setConnected(true));
@@ -31,9 +82,7 @@ function App() {
     });
 
     socket.on('scan:status', () => setScanning(true));
-
     socket.on('scan:complete', () => setScanning(false));
-
     socket.on('scan:error', (data) => {
       setScanning(false);
       console.error('Scan error:', data.message);
@@ -69,12 +118,7 @@ function App() {
     socket.on('exploit:error', (data) => {
       setLogEntries((prev) => [
         ...prev,
-        {
-          stage: 'error',
-          message: data.message,
-          status: 'error',
-          timestamp: new Date().toISOString(),
-        },
+        { stage: 'error', message: data.message, status: 'error', timestamp: new Date().toISOString() },
       ]);
       setExploitRunning(false);
     });
@@ -86,16 +130,43 @@ function App() {
       }
     });
 
-    socket.on('adb:status', (entry) => {
+    socket.on('track:status', (entry) => {
       if (entry.stage === 'complete') {
         setTrackingStatus(entry.status === 'success' ? 'success' : 'warning');
         setTrackingMessage(entry.message);
       } else if (entry.status === 'error') {
         setTrackingStatus('error');
         setTrackingMessage(entry.message);
+      } else {
+        setTrackingMessage(entry.message);
       }
       setLogEntries((prev) => [...prev, {
-        stage: `adb:${entry.stage}`,
+        stage: `track:${entry.stage}`,
+        message: entry.message,
+        status: entry.status,
+        timestamp: new Date().toISOString(),
+      }]);
+    });
+
+    socket.on('eavesdrop:status', (entry) => {
+      if (entry.stage === 'complete') {
+        setEavesdropStatus(entry.status === 'success' ? 'success' : 'warning');
+        setEavesdropMessage(entry.message);
+        if (entry.download_url) {
+          setEavesdropDownload(entry.download_url);
+        }
+      } else if (entry.stage === 'stopping') {
+        setEavesdropStatus('stopping');
+        setEavesdropMessage(entry.message);
+      } else if (entry.status === 'error') {
+        setEavesdropStatus('error');
+        setEavesdropMessage(entry.message);
+      } else {
+        setEavesdropStatus('recording');
+        setEavesdropMessage(entry.message);
+      }
+      setLogEntries((prev) => [...prev, {
+        stage: `eavesdrop:${entry.stage}`,
         message: entry.message,
         status: entry.status,
         timestamp: new Date().toISOString(),
@@ -114,7 +185,8 @@ function App() {
       socket.off('exploit:result');
       socket.off('exploit:error');
       socket.off('adb:devices');
-      socket.off('adb:status');
+      socket.off('track:status');
+      socket.off('eavesdrop:status');
     };
   }, [selectedDevice]);
 
@@ -140,6 +212,11 @@ function App() {
   const handleExecute = useCallback((address, strategies) => {
     setLogEntries([]);
     setResult(null);
+    setTrackingStatus(null);
+    setTrackingMessage('');
+    setEavesdropStatus(null);
+    setEavesdropMessage('');
+    setEavesdropDownload(null);
     setExploitRunning(true);
     setDeviceStatuses((prev) => ({ ...prev, [address]: 'in_progress' }));
     socket.emit('exploit:start', { address, strategies });
@@ -153,6 +230,11 @@ function App() {
   const handleVulnTest = useCallback((address, strategies) => {
     setLogEntries([]);
     setResult(null);
+    setTrackingStatus(null);
+    setTrackingMessage('');
+    setEavesdropStatus(null);
+    setEavesdropMessage('');
+    setEavesdropDownload(null);
     setExploitRunning(true);
     setDeviceStatuses((prev) => ({ ...prev, [address]: 'in_progress' }));
     socket.emit('vuln_test:start', { address, strategies });
@@ -163,15 +245,40 @@ function App() {
     socket.emit('adb:select', { device_id: deviceId });
   }, []);
 
-  const handleTrack = useCallback(() => {
+  const handleTrack = useCallback((inputBredr) => {
     if (!result?.br_edr_address) return;
-    setTrackingStatus('pairing');
+    if (inputBredr) setBredrAddress(inputBredr);
+    setTrackingStatus('scanning');
     setTrackingMessage('');
-    socket.emit('adb:pair', {
+    socket.emit('track:start', {
+      mode: attackMode,
       device_id: selectedAdbDevice,
-      br_edr_address: result.br_edr_address,
+      ble_address: result.br_edr_address,
+      bredr_address: inputBredr,
     });
-  }, [selectedAdbDevice, result]);
+  }, [selectedAdbDevice, result, attackMode]);
+
+  const handleEavesdrop = useCallback(() => {
+    const addr = bredrAddress || result?.br_edr_address;
+    if (!addr) return;
+    setEavesdropStatus('recording');
+    setEavesdropMessage('');
+    setEavesdropDownload(null);
+    socket.emit('eavesdrop:start', {
+      mode: attackMode,
+      device_id: selectedAdbDevice,
+      address: addr,
+    });
+  }, [selectedAdbDevice, result, bredrAddress, attackMode]);
+
+  const handleEavesdropStop = useCallback(() => {
+    socket.emit('eavesdrop:stop');
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close();
+      audioCtxRef.current = null;
+      nextPlayTimeRef.current = 0;
+    }
+  }, []);
 
   return (
     <div className="app">
@@ -200,10 +307,19 @@ function App() {
           onVulnTest={handleVulnTest}
           vulnTestMode={vulnTestMode}
           onToggleMode={() => setVulnTestMode((prev) => !prev)}
+          attackMode={attackMode}
+          onAttackModeChange={setAttackMode}
           trackingStatus={trackingStatus}
           trackingMessage={trackingMessage}
           onTrack={handleTrack}
           adbConnected={adbDevices.some((d) => d.status === 'device')}
+          bredrAddress={bredrAddress}
+          onBredrAddressChange={setBredrAddress}
+          eavesdropStatus={eavesdropStatus}
+          eavesdropMessage={eavesdropMessage}
+          eavesdropDownload={eavesdropDownload}
+          onEavesdrop={handleEavesdrop}
+          onEavesdropStop={handleEavesdropStop}
         />
       </main>
     </div>

@@ -1,6 +1,4 @@
-#!/bin/sh
-'''exec' "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC/venv/bin/python3" "$0" "$@"
-' '''
+#!/home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys

@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV '/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC/venv'
+set -gx VIRTUAL_ENV /home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/venv
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH

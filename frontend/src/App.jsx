@@ -253,10 +253,12 @@ function App() {
     socket.emit('track:start', {
       mode: attackMode,
       device_id: selectedAdbDevice,
-      ble_address: result.br_edr_address,
-      bredr_address: inputBredr,
+      ble_address: selectedDevice?.address,
+      bredr_address: inputBredr || result.br_edr_address,
+      device_name: selectedDevice?.name,
+      model_id: result.model_id,
     });
-  }, [selectedAdbDevice, result, attackMode]);
+  }, [selectedAdbDevice, selectedDevice, result, attackMode]);
 
   const handleEavesdrop = useCallback(() => {
     const addr = bredrAddress || result?.br_edr_address;

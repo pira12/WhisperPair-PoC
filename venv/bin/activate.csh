@@ -9,7 +9,7 @@ alias deactivate 'test $?_OLD_VIRTUAL_PATH != 0 && setenv PATH "$_OLD_VIRTUAL_PA
 # Unset irrelevant variables.
 deactivate nondestructive
 
-setenv VIRTUAL_ENV '/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC/venv'
+setenv VIRTUAL_ENV /home/pira/Documents/Study/SNE/AS/Bluetooth_Pairing_Security/WhisperPair-PoC/venv
 
 set _OLD_VIRTUAL_PATH="$PATH"
 setenv PATH "$VIRTUAL_ENV/"bin":$PATH"

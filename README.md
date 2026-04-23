@@ -1,15 +1,36 @@
 # WhisperPair - CVE-2025-36911
 
-![CVE](https://img.shields.io/badge/CVE-2025--36911-critical)
 ![Type](https://img.shields.io/badge/Exploit-Protocol%20Logic-red)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/Status-PoC-orange)
+![License](https://img.shields.io/badge/License-MIT-blue)
 
-**WhisperPair** is a Proof-of-Concept for **CVE-2025-36911**, a vulnerability in the **Google Fast Pair Service (GFPS)**. It includes a CLI exploit tool, a real-time web dashboard, and an Android companion app for scanning, testing, and exploiting vulnerable Bluetooth devices.
+**WhisperPair** is a research proof-of-concept that explores a pairing-mode-bypass weakness in the **Google Fast Pair Service (GFPS)**, tracked under the research identifier **CVE-2025-36911**. It includes a CLI exploit engine, a real-time web dashboard, and an Android companion app for scanning, testing, and demonstrating the impact against devices you own.
 
-**Key Insight:** Vulnerable devices accept RAW unencrypted Key-Based Pairing requests even when NOT in pairing mode - no Anti-Spoofing Public Key required.
+**Key insight:** Affected devices accept raw, unencrypted Key-Based Pairing requests even when they are **not** in pairing mode - no Anti-Spoofing Public Key required.
 
-> **WARNING:** This tool is for security research and testing on YOUR OWN devices only.
+---
+
+> ## ⚠️ Read this before running anything
+>
+> This repository contains working exploit code that can force-pair with
+> Bluetooth devices and stream their microphone audio without user
+> consent.
+>
+> - **Authorized use only.** Run this only against devices you own or
+>   have explicit, written permission to test.
+> - **Eavesdropping is regulated.** Capturing another person's audio is
+>   illegal in most jurisdictions, regardless of which hardware you ran
+>   the tool from.
+> - **No warranty.** The maintainers accept no responsibility for damage,
+>   data loss, or legal consequences arising from use of this code.
+> - **Research identifier.** "CVE-2025-36911" is the identifier this PoC
+>   tracks against. Verify its current status on the
+>   [CVE Program](https://www.cve.org/) or [NVD](https://nvd.nist.gov/)
+>   before treating it as a confirmed, published vulnerability.
+>
+> Full terms in [`DISCLAIMER.md`](DISCLAIMER.md). Vulnerability reporting
+> process in [`SECURITY.md`](SECURITY.md).
 
 ## Vulnerability Overview (CVE-2025-36911)
 
@@ -276,11 +297,22 @@ python3 -m pytest test_fast_pair_demo.py test_adb_manager.py -v
 
 ## References
 
-- [CVE-2025-36911](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-36911)
-- [WhisperPair Research](https://whisperpair.eu)
+- CVE-2025-36911 - look up the current status on the [CVE Program](https://www.cve.org/CVERecord?id=CVE-2025-36911) or [NVD](https://nvd.nist.gov/vuln/detail/CVE-2025-36911) before citing
 - [Google Fast Pair Specification](https://developers.google.com/nearby/fast-pair/spec)
 - [Bluetooth Core Spec - CTKD](https://www.bluetooth.com/specifications/specs/core-specification-6-0/) (Vol 3, Part H, Section 2.4.2.5)
 
+## Reporting issues
+
+- Bugs in this PoC: open a GitHub issue.
+- Security issues in this PoC or in third-party devices discovered while using it: see [`SECURITY.md`](SECURITY.md).
+
+## Acknowledgements
+
+Initial groundwork by **Bas Levering**, who kicked the project off. Later
+work and the public release are maintained by the WhisperPair Contributors.
+
 ## License
 
-MIT License. For authorized security research only.
+MIT License - see [`LICENSE`](LICENSE). Released for authorized security
+research and education only; see [`DISCLAIMER.md`](DISCLAIMER.md) for the
+full terms of use.

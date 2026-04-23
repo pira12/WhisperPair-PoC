@@ -107,6 +107,10 @@ function App() {
     socket.on('exploit:result', (res) => {
       setResult(res);
       setExploitRunning(false);
+      // Pre-fill the manual override when BR/EDR address needs correction
+      if (res.br_edr_address_needs_override && res.br_edr_address) {
+        setBredrAddress(res.br_edr_address);
+      }
       setDeviceStatuses((prev) => ({
         ...prev,
         [res.br_edr_address || selectedDevice?.address]: res.vulnerable
@@ -125,14 +129,41 @@ function App() {
 
     socket.on('adb:devices', (data) => {
       setAdbDevices(data.devices || []);
-      if (data.devices.length === 1 && !selectedAdbDevice) {
-        setSelectedAdbDevice(data.devices[0].id);
+      if (data.devices.length === 1) {
+        setSelectedAdbDevice((prev) => {
+          if (!prev) {
+            socket.emit('adb:select', { device_id: data.devices[0].id });
+            return data.devices[0].id;
+          }
+          return prev;
+        });
       }
     });
 
     socket.on('track:status', (entry) => {
       if (entry.stage === 'complete') {
         setTrackingStatus(entry.status === 'success' ? 'success' : 'warning');
+        setTrackingMessage(entry.message);
+        // Capture the resolved BR/EDR address from the companion app
+        if (entry.bredr_address) {
+          setBredrAddress(entry.bredr_address);
+          setResult((prev) => prev ? {
+            ...prev,
+            br_edr_address: entry.bredr_address,
+            br_edr_address_needs_override: false,
+          } : prev);
+        }
+      } else if (entry.stage === 'address_resolved' && entry.message) {
+        // Phone resolved the BR/EDR address — update immediately
+        const match = entry.message.match(/([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})/);
+        if (match) {
+          setBredrAddress(match[1]);
+          setResult((prev) => prev ? {
+            ...prev,
+            br_edr_address: match[1],
+            br_edr_address_needs_override: false,
+          } : prev);
+        }
         setTrackingMessage(entry.message);
       } else if (entry.status === 'error') {
         setTrackingStatus('error');
@@ -162,7 +193,12 @@ function App() {
         setEavesdropStatus('error');
         setEavesdropMessage(entry.message);
       } else {
-        setEavesdropStatus('recording');
+        // Don't revert to 'recording' if we're already stopping/done
+        setEavesdropStatus((prev) =>
+          prev === 'stopping' || prev === 'success' || prev === 'warning'
+            ? prev
+            : 'recording'
+        );
         setEavesdropMessage(entry.message);
       }
       setLogEntries((prev) => [...prev, {
@@ -246,7 +282,8 @@ function App() {
   }, []);
 
   const handleTrack = useCallback((inputBredr) => {
-    if (!result?.br_edr_address) return;
+    const effectiveBredr = inputBredr || result?.br_edr_address;
+    if (!effectiveBredr) return;
     if (inputBredr) setBredrAddress(inputBredr);
     setTrackingStatus('scanning');
     setTrackingMessage('');
@@ -254,9 +291,9 @@ function App() {
       mode: attackMode,
       device_id: selectedAdbDevice,
       ble_address: selectedDevice?.address,
-      bredr_address: inputBredr || result.br_edr_address,
+      bredr_address: effectiveBredr,
       device_name: selectedDevice?.name,
-      model_id: result.model_id,
+      model_id: result?.model_id,
     });
   }, [selectedAdbDevice, selectedDevice, result, attackMode]);
 
@@ -274,6 +311,8 @@ function App() {
   }, [selectedAdbDevice, result, bredrAddress, attackMode]);
 
   const handleEavesdropStop = useCallback(() => {
+    setEavesdropStatus('stopping');
+    setEavesdropMessage('Stopping eavesdrop...');
     socket.emit('eavesdrop:stop');
     if (audioCtxRef.current) {
       audioCtxRef.current.close();

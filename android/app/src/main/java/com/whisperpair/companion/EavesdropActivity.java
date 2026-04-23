@@ -37,7 +37,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * over a TCP socket (port 19876) for the dashboard to play in the browser.
  * Also saves the full recording to a WAV file.
  *
- * Launch:  adb shell am start -a com.whisperpair.EAVESDROP --es address "00:A4:1C:A0:35:FE"
+ * Launch:  adb shell am start -a com.whisperpair.EAVESDROP --es address "AA:BB:CC:DD:EE:FF"
  * Stop:    adb shell am broadcast -a com.whisperpair.STOP_EAVESDROP
  * Stream:  adb forward tcp:19876 tcp:19876 && nc localhost 19876
  */

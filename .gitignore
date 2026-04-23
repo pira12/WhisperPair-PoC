@@ -5,13 +5,28 @@ __pycache__/
 venv/
 .venv/
 *.egg-info/
+.pytest_cache/
 
 # Node
 node_modules/
+frontend/dist/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+*.apk
+*.aab
+*.dex
+*.class
+*.iml
 
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store
@@ -19,3 +34,9 @@ Thumbs.db
 
 # Environment
 .env
+*.env
+
+# Runtime / capture artifacts
+eavesdrop_recording.wav
+whisperpair_result_*.json
+*.pcapng

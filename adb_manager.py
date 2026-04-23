@@ -8,8 +8,71 @@ enables Bluetooth and verifies new bonds after the user accepts the
 Fast Pair notification on their phone.
 """
 
+import os
 import subprocess
 import re
+
+
+def _find_user_home():
+    """Find the real (non-root) user's home directory."""
+    import pwd
+
+    # 1. SUDO_USER is set when using sudo
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            return pwd.getpwnam(sudo_user).pw_dir
+        except KeyError:
+            pass
+
+    # 2. Look for the first /home/* user that has .android/adbkey
+    home_base = "/home"
+    if os.path.isdir(home_base):
+        for entry in os.listdir(home_base):
+            candidate = os.path.join(home_base, entry, ".android", "adbkey")
+            if os.path.isfile(candidate):
+                return os.path.join(home_base, entry)
+
+    # 3. Fall back to the invoking user's uid (covers non-sudo root)
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return os.environ.get("HOME", "/root")
+
+
+def _adb_env():
+    """Build environment so ADB works when the backend runs as root via sudo.
+
+    The ADB server is typically started by the normal user and owns the
+    USB authorization keys.  When we run under sudo, ADB defaults to
+    root's home and either starts a second (unauthorised) server or fails
+    to talk to the existing one.  Fix: find the real user's home, point
+    ADB_VENDOR_KEYS at their keys, and set HOME so ADB connects to the
+    existing server.
+    """
+    env = os.environ.copy()
+    if os.getuid() == 0:
+        user_home = _find_user_home()
+
+        adb_keys = os.path.join(user_home, ".android", "adbkey")
+        if os.path.isfile(adb_keys):
+            env["ADB_VENDOR_KEYS"] = adb_keys
+        env["HOME"] = user_home
+
+        android_home = os.path.join(user_home, "Android", "Sdk")
+        env.setdefault("ANDROID_HOME", android_home)
+
+        # Ensure adb binary is on PATH (root's PATH often lacks user SDK dirs)
+        platform_tools = os.path.join(android_home, "platform-tools")
+        if os.path.isdir(platform_tools):
+            path = env.get("PATH", "/usr/bin:/bin")
+            if platform_tools not in path:
+                env["PATH"] = platform_tools + ":" + path
+
+        # Tell ADB to connect to the user's existing server (port 5037)
+        # instead of starting a new root-owned server.
+        env.setdefault("ANDROID_ADB_SERVER_PORT", "5037")
+    return env
 
 
 class ADBManager:
@@ -23,8 +86,9 @@ class ADBManager:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=_adb_env(),
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except Exception:
             return []
 
         if result.returncode != 0:
@@ -54,25 +118,26 @@ class ADBManager:
 
     def get_device_info(self, device_id):
         """Get detailed info about a connected Android device."""
+        env = _adb_env()
         info = {"id": device_id, "model": "", "android_version": "", "bt_enabled": False}
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "getprop", "ro.product.model"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=env,
             )
             if result.returncode == 0:
                 info["model"] = result.stdout.strip()
 
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "getprop", "ro.build.version.release"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=env,
             )
             if result.returncode == 0:
                 info["android_version"] = result.stdout.strip()
 
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "settings", "get", "global", "bluetooth_on"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=env,
             )
             if result.returncode == 0:
                 info["bt_enabled"] = result.stdout.strip() == "1"
@@ -85,7 +150,7 @@ class ADBManager:
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "cmd", "bluetooth_manager", "enable"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, env=_adb_env(),
             )
             return result.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -96,7 +161,7 @@ class ADBManager:
         try:
             result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "dumpsys", "bluetooth_manager"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, env=_adb_env(),
             )
             if result.returncode != 0:
                 return set()
@@ -125,3 +190,4 @@ class ADBManager:
         bonded_after = self.get_bonded_addresses(device_id)
         new_devices = bonded_after - bonded_before
         return len(new_devices) > 0
+

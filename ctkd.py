@@ -296,7 +296,7 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
         print("Usage: python ctkd.py <bredr_address> [ble_address] [device_name_hint]")
-        print("Example: python ctkd.py 00:A4:1C:A0:35:FE AA:BB:CC:DD:EE:FF WF-C510")
+        print("Example: python ctkd.py AA:BB:CC:DD:EE:FF 11:22:33:44:55:66 WF-C510")
         sys.exit(1)
 
     bredr = sys.argv[1]

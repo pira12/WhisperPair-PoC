@@ -74,7 +74,9 @@ export default function TrackingPrereqs({
           <input
             type="text"
             className="bredr-input"
-            placeholder="BR/EDR address (e.g. 00:A4:1C:A0:35:FE)"
+            placeholder={result?.br_edr_address
+              ? `Auto: ${result.br_edr_address} (override below)`
+              : 'BR/EDR address (e.g. AA:BB:CC:DD:EE:FF)'}
             value={bredrAddress}
             onChange={(e) => onBredrAddressChange(e.target.value.toUpperCase())}
             maxLength={17}
@@ -82,15 +84,15 @@ export default function TrackingPrereqs({
           <button
             className="btn btn-track"
             onClick={() => onTrack(bredrAddress || null)}
-            disabled={!bredrAddress}
+            disabled={!bredrAddress && !result?.br_edr_address}
           >
             <Radio size={16} />
             {isLaptop ? 'Force Pair via Laptop' : 'Force Pair via Phone'}
           </button>
           <p className="bredr-hint">
-            {isLaptop
-              ? 'Classic BT address of the target device'
-              : "Find this in the device's BT settings on a previously paired phone"}
+            {result?.br_edr_address_needs_override
+              ? 'Auto-discovery failed — replace the BLE address above with the real Classic BT address (check paired phone settings)'
+              : 'Optional override — leave blank to use the auto-discovered address'}
           </p>
         </div>
       )}
